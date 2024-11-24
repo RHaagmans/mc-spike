@@ -1,0 +1,398 @@
+---
+title: "Mock community bias"
+author: "Rik Haagmans"
+date: '2024-8-19'
+output: html_document
+params:
+  output_dir: "../"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(params$output_dir))
+library(tidyverse)
+library(ggpubr)
+library(ggh4x)
+library(gt)
+source("helper_functions.R")
+source("data_files.R")
+```
+
+```{r load_data, message=FALSE}
+mc_particle_quantities <- read_csv(mc_quantities_file)
+mc_ref_to_virus <- read_csv(mc_ref_to_virus_file)
+
+mc_idxstats <- load_idxstats(mc_readmap_idxstats_file, set_assembly = "mc-genomes") %>%
+  left_join(
+    mc_ref_to_virus,
+    by = "ref"
+  )
+
+mc_idxstat_summary <- summarise_idxstats(mc_idxstats)
+
+mc_idxstats_by_virus <- calc_expected_levels(
+  sum_segment_readcounts(mc_idxstats),
+  mc_particle_quantities
+) %>% 
+  mutate(
+    base_sample = factor(base_sample, levels = base_sample_order),
+    spike = factor(spike, levels = spike_order),
+    rt_method = factor(rt_method, levels = method_order),
+    virus = factor(virus, levels = virus_order)
+  ) %>% 
+  arrange(sample, rt_method, virus)
+
+mc_expected_levels <- mc_idxstats_by_virus %>% 
+        group_by(virus, rt_method) %>% 
+        summarise(expected_frac = first(mc_expected_fraction))
+
+mc_rpkm_wta_vs_sispa <- mc_idxstats_by_virus %>%
+  mutate(
+    rpkm = (mapped_reads / (strands * ref_length/10^3)) / (tot_reads/10^6)
+    ) %>%
+  pivot_wider(
+    id_cols=c(base_sample, spike, virus), 
+    names_from = rt_method, 
+    values_from = rpkm
+    )
+```
+
+## Mock community read statistics
+
+Total and normalised number of reads mapping to MC viruses in WTA2 and SISPA
+libraries:
+
+```{r stats_mc_readmap_summary}
+mc_idxstat_summary %>%
+  ungroup() %>%
+  select(-assembly, -sample, -percent) %>%
+  mutate(total = total / 10^6) %>% 
+  pivot_wider(names_from = spike, values_from = c(total, mapped, per_10k)) %>%
+  arrange(base_sample, rt_method) %>%
+  gt %>%
+  tab_spanner(label = "Total reads (million)", starts_with("total_")) %>%
+  tab_spanner(label = "Mock community reads", starts_with("mapped_")) %>%
+  tab_spanner(label = "Mock community reads per 10,000 total", starts_with("per_10k_")) %>%
+  fmt_number(starts_with("total_"), decimals = 2) %>%
+  fmt_number(starts_with("mapped_"), decimals = 0, use_seps = TRUE) %>%
+  fmt_number(per_10k_HI, decimals = 0) %>%
+  fmt_number(per_10k_LO, decimals = 2) %>%
+  fmt_number(per_10k_NO, decimals = 2) %>%
+  cols_align(align = c("left"), columns = c(base_sample, rt_method)) %>%
+  sub_missing(missing_text = "-") %>%
+  cols_label(
+      ends_with("NO") ~ "NO",
+      ends_with("LO") ~ "LO",
+      ends_with("HI") ~ "HI",
+      base_sample ~ "Base sample",
+      rt_method ~ "Method"
+  )  
+```
+
+Fraction of reads in spiked sample WTA2 and SISPA libraries:
+
+```{r stats_mc_readmap_summary_across_samples}
+mc_idxstat_summary %>% 
+  filter(base_sample %in% base_sample_faecal) %>% 
+  group_by(rt_method, spike) %>% 
+  summarise(
+    tot_mapped = sum(mapped),
+    tot_reads = sum(total)
+  ) %>% 
+  mutate(
+    perc_mapped = round(100 * tot_mapped / tot_reads, digits = 2)
+  ) %>% 
+  arrange(spike, rt_method) %>% 
+  gt() %>%
+  fmt_percent(perc_mapped, decimals = 2, scale_values = FALSE) %>%
+  cols_label(
+        tot_mapped ~ "Total mapped reads",
+        tot_reads ~ "Total reads",
+        perc_mapped ~ "% Mapped reads",
+        spike ~ "MC",
+        rt_method ~ "Method"
+    ) 
+```
+
+Fraction of MC reads in each sample by virus, and fold difference from expected
+level:
+
+```{r stats_mc_readmap_by_virus}
+mc_idxstats_by_virus %>% 
+  filter(spike != "NO") %>%
+  select(base_sample, spike, rt_method, virus, mapped_reads, tot_reads, mc_expected_fraction) %>% 
+  group_by(base_sample, spike, rt_method) %>% 
+  mutate(perc_reads = mapped_reads / sum(mapped_reads)) %>% 
+  select(-mapped_reads, -tot_reads) %>%
+  pivot_wider(names_from = rt_method, values_from = perc_reads) %>% 
+  # left_join(enframe(virus_host, name="virus", value="host")) %>% 
+  # group_by(host) %>% 
+  group_by(virus) %>%
+  mutate(
+    diff_WTA2 = (WTA2 - mc_expected_fraction) / mc_expected_fraction,
+    diff_SISPA = (SISPA - mc_expected_fraction) / mc_expected_fraction
+    ) %>% 
+  gt() %>% 
+  cols_label(
+        base_sample ~ "Base sample",
+        spike ~ "MC",
+        mc_expected_fraction ~ "Expected %"
+    ) %>% 
+  fmt_number(starts_with("diff_")) %>% 
+  fmt_percent(mc_expected_fraction, decimals = 2) %>% 
+  fmt_percent(c(WTA2, SISPA), decimals = 2)
+```
+
+Number of reads mapping to reference sequences:
+
+```{r stats_reads_mapped}
+options(width = 1200)
+
+mc_idxstats %>% 
+  select(base_sample, spike, rt_method, ref, mapped_reads) %>% 
+  pivot_wider(names_from = rt_method, values_from = mapped_reads) %>% 
+  pivot_wider(names_from = c(base_sample, spike), values_from = c(SISPA, WTA2)) %>% 
+  gt() %>% 
+  tab_spanner_delim("_") %>% 
+  tab_options(table.font.size = "10px", container.width = pct(100))
+
+```
+
+Fraction of total reads mapping to reference sequences:
+
+```{r stats_frac_mapped}
+options(width = 1200)
+mc_idxstats %>% 
+  select(base_sample, spike, rt_method, ref, mapped_reads, tot_reads) %>% 
+  mutate(percent_mapped = mapped_reads / tot_reads ) %>% 
+  select(-c(mapped_reads, tot_reads)) %>% 
+  pivot_wider(names_from = rt_method, values_from = percent_mapped) %>% 
+  pivot_wider(names_from = c(base_sample, spike), values_from = c(SISPA, WTA2)) %>% 
+  gt() %>% 
+  tab_spanner_delim("_") %>% 
+  fmt_percent()%>% 
+  tab_options(table.font.size = "10px", container.width = pct(100))
+```
+
+Fraction of MC reads mapping to reference sequences:
+
+```{r stats_frac_mc_mapped}
+options(width = 1200)
+mc_idxstats %>% 
+  select(base_sample, spike, rt_method, ref, mapped_reads, tot_mapped) %>% 
+  mutate(percent_mapped = mapped_reads / tot_mapped ) %>% 
+  select(-c(mapped_reads, tot_mapped)) %>% 
+  pivot_wider(names_from = rt_method, values_from = percent_mapped) %>% 
+  pivot_wider(names_from = c(base_sample, spike), values_from = c(SISPA, WTA2)) %>% 
+  gt() %>% 
+  tab_spanner_delim("_") %>% 
+  fmt_percent()%>% 
+  tab_options(table.font.size = "10px", container.width = pct(100))
+```
+
+Fraction of MC reads in blank sample:
+
+```{r stats_mc_readmap_summary_blank}
+mc_idxstat_summary %>% 
+  filter(base_sample == "SBL") %>% 
+  group_by(rt_method, spike) %>% 
+  summarise(
+    tot_mapped = sum(mapped),
+    tot_reads = sum(total)
+  ) %>% 
+  mutate(
+    perc_mapped = round(100 * tot_mapped / tot_reads, digits = 2)
+  ) %>% 
+  arrange(spike, rt_method) %>% 
+  gt() %>%
+  fmt_percent(perc_mapped, decimals = 2, scale_values = FALSE) %>%
+  cols_label(
+        tot_mapped ~ "Total mapped reads",
+        tot_reads ~ "Total reads",
+        perc_mapped ~ "% Mapped reads",
+        spike ~ "MC",
+        rt_method ~ "Method"
+    ) 
+```
+
+```{r stats_mc_readmap_by_virus_blank}
+mc_idxstats_by_virus %>% 
+  filter(base_sample == "SBL") %>%
+  select(rt_method, virus, mapped_reads, tot_reads) %>% 
+  group_by(rt_method) %>% 
+  mutate(perc_reads = 100 * mapped_reads / sum(mapped_reads)) %>% 
+  select(-mapped_reads, -tot_reads) %>%
+  pivot_wider(names_from = rt_method, values_from = perc_reads) %>% 
+  left_join(enframe(virus_host, name="virus", value="host")) %>% 
+  group_by(host) %>% 
+  gt() %>% 
+  summary_rows(
+    columns = c(WTA2, SISPA), 
+    fns = list(Total ~ sum(.)), 
+    fmt=list(~fmt_percent(., scale_values = FALSE, decimals = 2)),
+    missing_text = ""
+    )%>% 
+  fmt_percent(c(WTA2, SISPA), decimals = 2, scale_values = FALSE)
+```
+
+
+## Mock community bias 
+
+Fraction of mock community reads of each virus, compared to expected levels:
+
+```{r plot_mc_read_fractions}
+mc_read_fraction_plot <- ggplot(
+  mc_idxstats_by_virus %>% filter(spike != "NO"),
+  aes(x=rt_method, y=100*(mapped_reads/tot_mapped), fill=paste0(base_sample, "-", spike))
+  )+
+  geom_bar(position=position_dodge(), stat="identity")+
+  geom_hline(
+    data=mc_expected_levels, 
+    aes(yintercept = 100 * expected_frac, color = "expected")
+    )+
+  nice_plot()+
+  facet_wrap(~virus, scales = "free_y", ncol = 4) +
+  scale_y_continuous(
+    limits = c(0,NA), 
+    expand = expansion(add=0, mult=c(0,0.1))
+    )+
+  scale_color_manual(
+    values = c("expected" = "blue"),
+    labels = c("expected" = "Expected %")
+    )+
+  colorscheme_sample_fill+
+  theme(
+    legend.position = "bottom",
+    axis.title.x = element_blank(),
+    strip.text = element_text(size=9, face="bold")
+    )+
+  nice_legend_tight_y+
+  labs(
+    y = "% mock community reads",
+    fill = "Sample",
+    color = ""
+  )
+  
+mc_read_fraction_plot
+
+ggsave(
+  "figures/mc_bias/mc_spiked_WTA2_vs_SISPA.png", 
+  plot = mc_read_fraction_plot,
+  width = 16, height = 9, dpi=300, unit="cm"
+  )
+```
+
+Correlation between WTA2 and SISPA MC read fractions:
+
+```{r plot_mc_read_fractions_wta2_vs_sispa}
+ggplot(
+  mc_idxstats_by_virus %>% 
+    filter(spike != "NO" & base_sample != "SMC") %>% 
+    mutate(frac_mc_reads = mapped_reads/tot_mapped) %>% 
+    pivot_wider(id_cols = c(base_sample, spike, virus), names_from = rt_method, values_from = frac_mc_reads),
+  aes(x=WTA2, y=SISPA)
+  )+
+  geom_smooth(method="lm", color = "black")+
+  geom_point(aes(color=paste0(base_sample, "-", spike), shape = spike))+
+  stat_cor(method="pearson", color = "black")+
+  nice_plot()+
+  facet_wrap(~virus, scales = "free", ncol = 4) +
+  colorscheme_sample_color+
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(size=9, face="bold")
+    )+
+  nice_legend_tight_y+
+  labs(
+    x = "% mock community reads WTA2",
+    y = "% mock community reads SISPA",
+    color = "Sample"
+  )
+```
+Mock community virus abundance in spiked samples, comparing WTA2 to SISPA:
+
+```{r plot_mc_abundance_spiked}
+plot_limits <- c(-4, 3)
+
+mc_spiked_wta_v_sispa_plot <- ggplot(
+  mc_rpkm_wta_vs_sispa %>% filter(base_sample %in% base_sample_faecal),
+  aes(x = log10(WTA2), y = log10(SISPA))
+) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed"
+    )+
+  geom_point(aes(color = base_sample, shape = spike)) +
+  nice_plot() +
+  scale_x_continuous(limits = plot_limits) +
+  scale_y_continuous(limits = plot_limits) +
+  colorscheme_base_sample_color +
+  scale_shape_manual(values = spike_shapes) +
+  facet_wrap(~ virus, ncol = 4) +
+  labs(
+    x = "WTA2 abundance [log10(RPKM)]",
+    y = "SISPA abundance [log10(RPKM)]",
+    shape = "Spike",
+    color = "Faecal sample"
+  ) +
+  theme(
+    aspect.ratio = 1,
+    legend.position = "inside",
+    legend.position.inside = c(1, 0.4),
+    legend.justification = c(1, 1),
+    legend.box = "horizontal",
+    legend.margin = margin(0,0,0,0),
+    legend.box.spacing = unit(0.4, "line"),
+    legend.box.margin = margin(0,0,0,0),
+    strip.text = element_text(size = 9, face = "bold"),
+    panel.grid = element_line(colour = "grey70", linewidth = 0.3)
+  )
+
+mc_spiked_wta_v_sispa_plot
+
+ggsave(
+  "figures/mc_bias/mc_spiked_WTA2_vs_SISPA.png",
+  plot = mc_spiked_wta_v_sispa_plot,
+  width = 16, height = 10, dpi=300, unit="cm"
+  )
+```
+
+Mock community virus abundance in Mock Community controls, comparing WTA2 to SISPA:
+
+```{r plot_mc_abundance_control}
+mc_control_wta_v_sispa <- ggplot(
+  mc_rpkm_wta_vs_sispa %>% filter(base_sample == "SMC"),
+  aes(
+    x = log10(WTA2),
+    y = log10(SISPA),
+    color = virus
+  )
+) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    color = "grey23",
+    linetype = "dashed"
+  ) +
+  geom_point(size = 1.8) +
+  facet_wrap(~ spike)+
+  nice_plot() +
+  scale_x_continuous(limits = c(-2, 5)) +
+  scale_y_continuous(limits = c(-2, 5)) +
+  colorscheme_virus_color +
+  theme(aspect.ratio = 1, strip.text = element_text(size = 9, face = "bold")) +
+  labs(
+    x = "WTA2 [log10(RPKM)]",
+    y = "SISPA [log10(RPKM)]",
+    color = ""
+    ) +
+  guides(color = guide_legend(ncol = 2, byrow = FALSE))
+
+mc_control_wta_v_sispa
+
+ggsave(
+  "figures/mc_bias/mc_control_WTA2_vs_SISPA.png", 
+  plot = mc_control_wta_v_sispa,
+  width = 14, height = 5.5, dpi=300, unit="cm")
+```

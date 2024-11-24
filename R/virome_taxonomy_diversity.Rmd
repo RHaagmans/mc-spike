@@ -1,0 +1,776 @@
+---
+title: "Virome taxonomy and diversity"
+author: "Rik Haagmans"
+date: "2024-08-27"
+output: html_document
+params:
+  output_dir: "../"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(params$output_dir))
+library(tidyverse)
+library(phyloseq)
+library(vegan)
+library(ggh4x)
+library(ggsci)
+library(ggtext)
+library(gt)
+source("helper_functions.R")
+source("data_files.R")
+
+
+mc_blast_min_cov <- 95
+mc_blast_min_ani <- 98
+```
+
+```{r load_sample_metadata}
+sample_sheet = load_sample_sheet(sample_sheet_file) %>%
+  select(-fw_readfile, -rv_readfile)
+```
+
+```{r load_data_virome, message=FALSE} 
+virome_mc_contigs <-
+  load_blast_ani_results(assembly_mcblast_results_file)
+
+virome_genomad_results <-
+  load_genomad(assembly_genomad_results_file) %>%
+  filter(topology != "Provirus",
+         # "Conservative" minimum score according to geNomad manual
+         virus_score > 0.8) %>%
+  mutate(unique_contig = paste0(assembly, "_", contig)) %>%
+  anti_join(virome_mc_contigs, by = c("assembly", "contig"))
+
+virome_checkv_results <- load_checkv_data(assembly_checkv_results_file)
+
+assembly_idxstats <- load_idxstats(assembly_idxstats_file) %>% 
+  rename(contig = ref)
+
+virome_idxstats <- assembly_idxstats %>% 
+  filter_faecal_virus_sequences(virome_genomad_results)
+
+assembly_classification <- assembly_idxstats %>% 
+  distinct(assembly, contig, length, base_sample, spike, rt_method, rpkm) %>% 
+  left_join(
+    virome_mc_contigs %>% 
+      select(assembly, contig) %>% 
+      mutate(is_mock = TRUE),
+    by = c("assembly", "contig")
+  ) %>% 
+  left_join(
+    virome_genomad_results %>% 
+      select(assembly, contig) %>% 
+      mutate(is_viral = TRUE),
+    by = c("assembly", "contig")
+    ) %>% 
+  mutate(
+    is_mock = replace_na(is_mock, FALSE),
+    is_viral = replace_na(is_viral, FALSE)
+    )
+
+```
+
+```{r load_data_coassembly, message=FALSE} 
+
+coassembly_mc_contigs <-
+  load_blast_ani_results(coassembly_mcblast_results_file)
+
+coassembly_genomad_results <-
+  load_genomad(coassembly_genomad_results_file) %>%
+  filter(topology != "Provirus",
+         # "Conservative" minimum score according to geNomad manual
+         virus_score > 0.8) %>%
+  mutate(unique_contig = paste0(assembly, "_", contig)) %>%
+  # Remove mock community sequences from the data set
+  anti_join(virome_mc_contigs, by = c("assembly", "contig"))
+
+coassembly_idxstats_full <- load_idxstats(coassembly_idxstats_file) %>%
+  rename(contig = ref) 
+
+coassembly_idxstats <- coassembly_idxstats_full %>%
+  filter_faecal_virus_sequences(coassembly_genomad_results)
+```
+
+```{r setup_phyloseq_assembly, message=FALSE}
+sample_meta <- sample_sheet %>%
+  # R replaces "-" with "." when making df's and matrices...
+  mutate(sample_name = str_replace_all(sample_name, "-", "_"),
+         sample_number_tmp = row_number()) %>%
+  rename(sample = sample_name) %>%
+  select(-assembly, -coassembly)
+
+tax_mat <- as.matrix(
+  virome_genomad_results %>%
+    select(
+      unique_contig,
+      Superkingdom,
+      Realm,
+      Kingdom,
+      Phylum,
+      Subphylum,
+      Class,
+      Order,
+      Suborder,
+      Family,
+      Subfamily,
+      Genus
+    ) %>%
+    remove_rownames() %>%
+    column_to_rownames(var = 'unique_contig')
+)
+
+ph_meta <- sample_data(sample_meta %>%
+                         remove_rownames() %>%
+                         column_to_rownames(var = "sample"))
+
+ph_tax <- tax_table(tax_mat)
+
+ph_otu <- list()
+ph_virome_composition <- list()
+for (measure in c("mapped_reads", "rpkm", "relab")) {
+  otu_mat <- transform_idxstats_to_matrix(virome_idxstats, measure)
+  ph_otu[[measure]] <- otu_table(otu_mat, taxa_are_rows = F)
+  ph_virome_composition[[measure]] <- phyloseq(ph_otu[[measure]],
+                                               ph_meta,
+                                               ph_tax)
+}
+```
+
+```{r setup_phyloseq_coassembly, message=FALSE}
+tax_mat_coassembly <- as.matrix(
+  coassembly_genomad_results %>%
+    select(
+      unique_contig,
+      Superkingdom,
+      Realm,
+      Kingdom,
+      Phylum,
+      Subphylum,
+      Class,
+      Order,
+      Suborder,
+      Family,
+      Subfamily,
+      Genus
+    ) %>%
+    remove_rownames() %>%
+    column_to_rownames(var = 'unique_contig')
+)
+
+ph_tax_coassembly <- tax_table(tax_mat_coassembly)
+
+ph_otu_coassembly <- list()
+ph_coassembly_composition <- list()
+
+for (measure in c("mapped_reads", "rpkm", "relab")) {
+  otu_mat <-
+    transform_idxstats_to_matrix(coassembly_idxstats, measure)
+  ph_otu_coassembly[[measure]] <-
+    otu_table(otu_mat, taxa_are_rows = F)
+  ph_coassembly_composition[[measure]] <- phyloseq(ph_otu_coassembly[[measure]],
+                                                   ph_meta,
+                                                   ph_tax_coassembly)
+}
+```
+
+```{r calc_alpha_diversity}
+alpha_methods <- c("Chao1", "Shannon", "Simpson")
+
+calc_alphas <- function(ph_data, measures) {
+  return(
+    as_tibble(estimate_richness(ph_data,
+                                measures = measures),
+              rownames = "sample") %>%
+      left_join(sample_meta,
+                by = "sample") %>%
+      select(-starts_with('se.'))
+  )
+}
+
+virome_alpha <- calc_alphas(
+  ph_virome_composition$mapped_reads, 
+  alpha_methods
+  ) %>%
+  pivot_longer(
+    cols = any_of(alpha_methods),
+    names_to = "alpha_method",
+    values_to = "richness"
+  )
+```
+
+```{r calc_beta_diversity}
+bc_dissimilarity_matrix <- vegdist(
+  data.frame(ph_otu_coassembly$relab), 
+  method = "bray"
+  )
+
+sample_dissimilarities <- as_tibble(
+  as.matrix(bc_dissimilarity_matrix),
+  rownames = "sample"
+  ) %>%
+  pivot_longer(-sample, names_to = "sampleB", values_to = "bray") %>%
+  left_join(sample_meta,
+            by = "sample") %>%
+  left_join(
+    sample_meta %>%
+      rename(
+        sampleB = sample,
+        base_sampleB = base_sample,
+        spikeB = spike,
+        rt_methodB = rt_method,
+        replicateB = replicate,
+        sample_number_tmpB = sample_number_tmp
+      ),
+    by = "sampleB"
+  ) %>%
+  rowwise() %>% 
+  mutate(sample_nr_combination = paste0(min(sample_number_tmp, sample_number_tmpB),"-",max(sample_number_tmp, sample_number_tmpB))) %>% 
+  droplevels()
+
+relevant_dissimilarities <- sample_dissimilarities %>% 
+      filter(
+        base_sample == base_sampleB & 
+          rt_method == rt_methodB &
+          !(spike == spikeB)
+        ) %>%
+      distinct(sample_nr_combination, .keep_all = TRUE) %>% 
+      mutate(
+        distance = paste(spike,"-", spikeB)
+      )
+```
+
+## Virus classification
+
+### Fraction viral contigs
+
+```{r stats_assemby_n_viral}
+assembly_classification %>%
+  group_by(base_sample, spike, rt_method) %>%
+  summarise(
+    n_total = n(),
+    n_mock = sum(is_mock),
+    n_viral = sum(is_viral),
+    n_unclass = n() - (sum(is_mock) + sum(is_viral))
+  ) %>%
+  pivot_longer(cols = starts_with("n_"),
+               names_to = "class",
+               values_to = "n_contigs") %>%
+  pivot_wider(names_from = c(spike, rt_method), values_from = n_contigs)
+
+assembly_classification %>%
+  group_by(rt_method) %>%
+  summarise(
+    n_total = n(),
+    n_mock = sum(is_mock),
+    n_viral = sum(is_viral),
+    n_unclass = n() - (sum(is_mock) + sum(is_viral))
+  ) %>%
+  pivot_longer(cols = starts_with("n_"),
+               names_to = "class",
+               values_to = "n_contigs") %>%
+  pivot_wider(names_from = rt_method, values_from = n_contigs)
+```
+
+
+
+Percentage of contigs classified as mock community, faecal viral, or 
+unclassified:
+
+```{r stats_assembly_percent_viral}
+assembly_classification %>%
+  group_by(base_sample, spike, rt_method) %>%
+  summarise(
+    n_total = n(),
+    n_mock = sum(is_mock),
+    n_viral = sum(is_viral),
+    n_unclass = n() - (sum(is_mock) + sum(is_viral))
+  ) %>%
+  mutate(
+    p_mock = 100 * n_mock / n_total,
+    p_viral = 100 * n_viral / n_total,
+    p_unclass = 100 * n_unclass / n_total
+  ) %>%
+  select(-starts_with("n_")) %>%
+  pivot_longer(cols = starts_with("p_"),
+               names_to = "class",
+               values_to = "n_contigs") %>%
+  pivot_wider(names_from = c(spike, rt_method),
+              values_from = n_contigs)
+
+assembly_classification %>%
+  group_by(rt_method) %>%
+  summarise(
+    n_total = n(),
+    n_mock = sum(is_mock),
+    n_viral = sum(is_viral),
+    n_unclass = n() - (sum(is_mock) + sum(is_viral))
+  ) %>%
+  mutate(
+    p_mock = 100 * n_mock / n_total,
+    p_viral = 100 * n_viral / n_total,
+    p_unclass = 100 * n_unclass / n_total
+  ) %>%
+  select(-starts_with("n_")) %>%
+  pivot_longer(cols = starts_with("p_"),
+               names_to = "class",
+               values_to = "p_contigs") %>%
+  pivot_wider(names_from = rt_method,
+              values_from = p_contigs)
+
+```
+
+```{r stats_assembly_relab_viral}
+assembly_classification %>%
+  group_by(base_sample, spike, rt_method) %>%
+  summarise(
+    tot_relab_mock = 100 * sum(rpkm[is_mock]) / sum(rpkm),
+    tot_relab_viral = 100 * sum(rpkm[is_viral]) / sum(rpkm),
+    tot_relab_unclass = 100 * sum(rpkm[!is_mock & !is_viral]) / sum(rpkm)
+  ) %>% 
+  pivot_longer(cols = starts_with("tot_relab_"),
+               names_to = "class",
+               values_to = "relab") %>%
+  pivot_wider(names_from = c(spike, rt_method),
+              values_from = relab)
+
+assembly_classification %>%
+  group_by(rt_method) %>%
+  summarise(
+    tot_relab_mock = 100 * sum(rpkm[is_mock]) / sum(rpkm),
+    tot_relab_viral = 100 * sum(rpkm[is_viral]) / sum(rpkm),
+    tot_relab_unclass = 100 * sum(rpkm[!is_mock & !is_viral]) / sum(rpkm)
+  ) %>% 
+  pivot_longer(cols = starts_with("tot_relab_"),
+               names_to = "class",
+               values_to = "relab") %>%
+  pivot_wider(names_from = rt_method,
+              values_from = relab)
+
+```
+
+```{r stats_assembly_virrelab_viral}
+assembly_classification %>%
+  group_by(base_sample, spike, rt_method) %>%
+  summarise(
+    tot_relab_mock = 100 * sum(rpkm[is_mock]) / sum(rpkm[is_mock | is_viral]),
+    tot_relab_viral = 100 * sum(rpkm[is_viral]) / sum(rpkm[is_mock | is_viral])
+  ) %>% 
+  pivot_longer(cols = starts_with("tot_relab_"),
+               names_to = "class",
+               values_to = "vir_relab") %>%
+  pivot_wider(names_from = c(spike, rt_method),
+              values_from = vir_relab)
+
+assembly_classification %>%
+  group_by(rt_method) %>%
+  summarise(
+    tot_relab_mock = 100 * sum(rpkm[is_mock]) / sum(rpkm[is_mock | is_viral]),
+    tot_relab_viral = 100 * sum(rpkm[is_viral]) / sum(rpkm[is_mock | is_viral])
+  ) %>% 
+  pivot_longer(cols = starts_with("tot_relab_"),
+               names_to = "class",
+               values_to = "vir_relab") %>%
+  pivot_wider(names_from = rt_method,
+              values_from = vir_relab)
+
+```
+
+
+```{r stats_frac_viral2}
+assembly_classification_stats_sample <- assembly_classification %>% 
+  group_by(base_sample, spike, rt_method) %>% 
+  summarise(
+    n = n(),
+    n_mock = sum(is_mock),
+    cumlen_mock = sum(length[is_mock]),
+    tot_relab_mock = 100 * sum(rpkm[is_mock]) / sum(rpkm),
+    vir_relab_mock = 100 * sum(rpkm[is_mock]) / sum(rpkm[is_mock | is_viral]),
+    n_viral = sum(is_viral),
+    cumlen_viral = sum(length[is_viral]),
+    tot_relab_viral = 100 * sum(rpkm[is_viral]) / sum(rpkm)
+  ) %>% 
+  mutate(
+    p_mock = 100 * n_mock / n,
+    p_viral = 100 * n_viral / n
+  )
+  
+assembly_classification_stats_sample %>% 
+  select(base_sample, spike, rt_method, vir_relab_mock) %>% 
+  pivot_wider(names_from = rt_method, values_from = vir_relab_mock)
+
+assembly_classification_stats_rt <- assembly_classification %>% 
+  group_by(rt_method) %>% 
+  summarise(
+    n = n(),
+    n_mock = sum(is_mock),
+    cumlen_mock = sum(length[is_mock]),
+    tot_relab_mock = 100 * sum(rpkm[is_mock]) / sum(rpkm),
+    vir_relab_mock = 100 * sum(rpkm[is_mock]) / sum(rpkm[is_mock | is_viral]),
+    n_viral = sum(is_viral),
+    cumlen_viral = sum(length[is_viral]),
+    tot_relab_viral = 100 * sum(rpkm[is_viral]) / sum(rpkm)
+  ) %>% 
+  mutate(
+    p_mock = 100 * n_mock / n,
+    p_viral = 100 * n_viral / n
+  )
+  
+assembly_classification_stats_rt
+
+```
+
+### Blank sample
+
+Contigs in blank assemblies with at least 50% complete genomes:
+
+```{r blank_samples}
+
+virome_contigs <-  left_join(
+  virome_idxstats %>% 
+    group_by(assembly, contig) %>% 
+    summarise(length = first(length)),
+  virome_mc_contigs %>% 
+    select(assembly, contig, ref) %>% 
+    rename(mc_match = ref) %>% 
+    mutate(is_mock = T),
+  by = c("assembly", "contig")
+) %>%
+  left_join(
+    virome_genomad_results %>%
+      select(assembly, contig, virus_score, Phylum, Class, Family) %>%
+      mutate(is_viral = T),
+    by = c("assembly", "contig")
+  ) %>%
+  left_join(virome_checkv_results,
+            by = c("assembly", "contig")) %>%
+  mutate(
+    is_mock = replace_na(is_mock, F),
+    is_viral = replace_na(is_viral, F),
+    contig_class = case_when(
+      is_mock ~ contig_classifications[["mc"]],
+      (is_viral & !is_mock) ~ contig_classifications[["endo"]],
+      (!is_viral & !is_mock) ~ contig_classifications[["unsure"]]
+    ),
+    contig_class = factor(contig_class, levels = contig_classifications)
+  )
+
+virome_contigs %>% 
+  filter(
+    str_starts(assembly, "SBL") &
+      checkv_quality_num > 1
+  ) %>% 
+  mutate(
+    mc_match = replace_na("-")
+  ) %>% 
+  select(
+    -is_mock,
+    -is_viral,
+    -contig_length,
+    -proviral_length,
+    -host_genes,
+    -miuvig_quality,
+    -completeness_method,
+    -contamination,
+    -kmer_freq,
+    -warnings,
+    -checkv_quality_num,
+    -contig_class
+  ) %>% 
+  gt() %>% 
+  fmt_number(length, decimals = 0) %>% 
+  sub_missing(
+    columns = c(Phylum, Class, Family),
+    missing_text = md("*not determined*")
+  )
+```
+
+
+### Taxonomic composition
+
+```{r plot_tax_phyla}
+plot_bar(
+  transform_sample_counts(
+    subset_samples(
+    ph_virome_composition$rpkm,
+    base_sample %in% base_sample_faecal
+    ),
+    function(x) x/sum(x)
+  ),
+  x = "spike", y = "Abundance", fill = "Phylum", facet_grid = rt_method ~ base_sample
+  ) +
+  geom_bar(aes(fill = Phylum, color = Phylum), stat = "identity") +
+  nice_plot()
+
+```
+
+```{r taxonomy_stats}
+virome_composition_tb <- phyloseq_to_tibble(ph_virome_composition$relab, sample_meta) %>% 
+    filter(base_sample %in% base_sample_faecal)
+```
+
+```{r stats_perc_classified_taxrank}
+virome_idxstats %>% 
+  distinct(assembly, contig) %>% 
+  left_join(
+    virome_genomad_results,
+    by= join_by(assembly, contig)
+  ) %>% 
+  group_by(assembly) %>% 
+  summarise(
+    p_class = sum(!is.na(Class)) / n(),
+    p_order = sum(!is.na(Order)) / n(),
+    p_family = sum(!is.na(Family)) / n()
+    ) %>% 
+  ungroup() %>% 
+  summarise(
+    mean_p_class = mean(p_class),
+    mean_p_order = mean(p_order),
+    mean_p_family = mean(p_family)
+  )
+```
+
+
+The top 5 Phyla across samples, measured as the five phyla with the highest 
+relative abundance in any of the samples. Also displayed is the mean relative
+abundance of the phyla across all samples.
+
+```{r top5_phyla, message=FALSE}
+top_phyla <- virome_composition_tb %>% 
+  group_by(base_sample, spike, rt_method, Phylum) %>%
+  summarise(
+    tot_relab = sum(relab)
+  ) %>% 
+  group_by(
+    Phylum
+  ) %>% 
+  summarise(
+    highest_relab = max(tot_relab),
+    mean_relab = mean(tot_relab)
+  ) %>% 
+  arrange(desc(highest_relab))
+
+top5_phyla <- top_phyla %>% slice_head(n = 5) %>% pull(Phylum)
+
+top_phyla %>% 
+  slice_head(n = 5) %>% 
+  gt() %>% 
+  fmt_percent(ends_with("_relab"), decimals = 2) %>% 
+  cols_label(
+    highest_relab ~ "Highest abundance",
+    mean_relab ~ "Mean abundance"
+  ) 
+```
+
+```{r plot_top5_phyla}
+phylum_levels <- c("Other", sort(top5_phyla))
+
+italics_labels <- c("Other", sapply(sort(top5_phyla), function(x) return(expr(italic(!!x))), USE.NAMES=FALSE))
+
+top5_phyla_relab <- virome_composition_tb %>% 
+  group_by(base_sample, spike, rt_method, Phylum) %>% 
+  summarise(tot_relab = sum(relab)) %>% 
+  filter(Phylum %in% top5_phyla) %>% 
+  ungroup(Phylum) %>% 
+  complete(Phylum = c(top5_phyla, "Other"), fill = list(tot_relab = 0)) %>% 
+  mutate(
+    tot_relab = if_else(Phylum == "Other", 1 - sum(tot_relab), tot_relab),
+    Phylum = factor(Phylum, levels = phylum_levels)
+  )
+
+tax_comp_top_plot <- ggplot(
+  top5_phyla_relab,
+  aes(x = spike, y = 100 * tot_relab, fill = Phylum)
+) +
+  geom_bar(stat = "identity") +
+  facet_grid(rt_method ~ base_sample) +
+  nice_plot() +
+  scale_y_continuous(expand = nice_scale_expansion_zero) +
+  scale_fill_jco(labels = c("Other", paste0("*",sort(top5_phyla),"*"))) +
+  labs(x = "spike", y = "relative abundance (%)", fill = "Phylum") +
+  theme(
+    legend.text = element_markdown(hjust = 0)
+    )
+
+tax_comp_top_plot
+
+ggsave(
+  "figures/virome_taxonomy/virome_taxonomic_composition_top5.png",
+  plot = tax_comp_top_plot,
+  width = 16,
+  height = 11,
+  unit = "cm",
+  dpi = 300
+)
+```
+
+Variation in relative abundance at the phylum level between replicates of the 
+base faecal samples. The range is the difference in percentage points between 
+the highest and lowest relative abundance of three replicates. 
+
+```{r stats_top5_phyla, message=FALSE}
+cols_order <-
+  unlist(lapply(base_sample_faecal, function(x)
+    paste(x, c("Mean", "Range", "FD"), sep = "_")))
+
+virome_composition_tb %>%
+  group_by(base_sample, spike, rt_method, Phylum) %>%
+  summarise(tot_relab = sum(relab)) %>%
+  filter(Phylum %in% top5_phyla) %>%
+  group_by(base_sample, Phylum, rt_method) %>%
+  summarise(Mean = mean(tot_relab),
+            Range = 100 * (max(tot_relab) - min(tot_relab)),
+            FD = max(tot_relab) / min(tot_relab) ) %>%
+  pivot_wider(
+    names_from = base_sample,
+    values_from = c(Mean, Range, FD),
+    names_glue = "{base_sample}_{.value}"
+  ) %>%
+  select(all_of(c("Phylum", "rt_method", cols_order))) %>%
+  rename(Method = rt_method) %>%
+  mutate(Phylum = factor(Phylum, levels = top5_phyla)) %>%
+  ungroup() %>%
+  arrange(Phylum) %>%
+  gt(rowname_col = "Phylum") %>%
+  tab_spanner_delim(delim = "_") %>%
+  fmt_number(ends_with(c("Range", "FD")), decimals = 3) %>%
+  fmt_percent(ends_with("Mean"), decimals = 3)
+```
+
+```{r stats_top5_ratios}
+
+virome_composition_tb %>%
+  group_by(base_sample, spike, rt_method, Phylum) %>%
+  summarise(tot_relab = sum(relab)) %>%
+  filter(Phylum %in% top5_phyla) %>%
+  group_by(base_sample, Phylum, rt_method) %>%
+  summarise(Mean = mean(tot_relab),
+            Range = 100 * (max(tot_relab) - min(tot_relab)),
+            FD = max(tot_relab) / min(tot_relab) ) %>% 
+  group_by(Phylum, rt_method) %>% 
+  summarise(
+    min_FD = min(FD), max_FD = max(FD),
+    min_Range = min(Range), max_Range = max(Range)
+  )
+```
+
+
+```{r stats_minmax_FD_Range}
+virome_composition_tb %>%
+  group_by(base_sample, spike, rt_method, Phylum) %>%
+  summarise(tot_relab = sum(relab)) %>%
+  filter(Phylum %in% top5_phyla) %>%
+  group_by(base_sample, Phylum, rt_method) %>%
+  summarise(Mean = mean(tot_relab),
+            Range = 100 * (max(tot_relab) - min(tot_relab)),
+            FD = max(tot_relab) / min(tot_relab) ) %>% 
+  group_by(Phylum, rt_method) %>% 
+  summarise(
+    min_FD = min(FD), max_FD = max(FD),
+    min_Range = min(Range), max_Range = max(Range)
+  )
+
+```
+
+## Diversity 
+
+### Alpha diversity
+
+```{r plot_alpha_diversity}
+selected_alpha_methods <- c("Chao1", "Shannon", "Simpson")
+selected_samples <- c("S06", "S07", "S08")
+
+virome_alpha_plot <- ggplot(
+  virome_alpha %>%
+    filter(base_sample %in% selected_samples) %>%
+    mutate(
+      richness = if_else(
+        alpha_method == "Chao1", log10(richness), richness),
+      alpha_method = if_else(
+        alpha_method == "Chao1", "Chao1\n(log10)", alpha_method),
+    ),
+  aes(x = spike, y = richness, color = rt_method)
+) +
+  geom_point(size = 1) +
+  nice_plot() +
+  facet_grid(alpha_method ~ base_sample, scales = "free_y") +
+  scale_color_manual(values = method_palette) +
+  ylim(0, NA) +
+  theme(strip.text = element_text(size = 9, face = "bold")) +
+  labs(x = "",
+       y = "alpha diversity",
+       color = "")
+
+virome_alpha_plot
+
+ggsave(
+  "figures/virome_taxonomy/virome_alpha_diversity.png",
+  plot = virome_alpha_plot +
+    theme(
+      legend.position = "bottom",
+      legend.box = "horizontal",
+      legend.margin = margin(0, 0, 0, 0)
+    ),
+  width = 11,
+  height = 9,
+  unit = "cm",
+  dpi = 300
+)
+
+```
+
+```{r stats_alpha_diversity}
+virome_alpha %>%
+  filter(alpha_method == "Chao1" & base_sample %in% base_sample_faecal) %>%
+  group_by(base_sample, rt_method) %>%
+  summarise(
+    mean = mean(richness),
+    sd = sd(richness),
+    cv = sd/mean
+  ) %>% 
+  group_by(rt_method) %>% 
+  summarise(mean_cv = mean(cv))
+```
+
+### Beta diversity
+
+```{r plot_beta_diversity}
+virome_beta_plot <- ggplot(
+    relevant_dissimilarities,
+    aes(
+      x = interaction(base_sample, rt_method),
+      y = 1 - bray,
+      shape = distance,
+      color = rt_method
+    )
+  ) +
+  # geom_bar(stat = "summary", position = "dodge")+
+  geom_point(size = 1) +
+  nice_plot() +
+  scale_x_discrete(guide = guide_axis_nested()) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  scale_color_manual(values = method_palette, guide = "none") +
+  theme(legend.position = "bottom") +
+  # thesis_legend_bottom_tight+
+  theme(legend.direction = "vertical") +
+  rotate_x_text() +
+  labs(y = "Bray-Curtis similarity",
+       x = "",
+       fill = "",
+       shape = "comparison")
+
+virome_beta_plot
+ggsave(
+  "figures/virome_taxonomy/virome_beta_diversity.png",
+  plot = virome_beta_plot + theme(
+    legend.position = "bottom",
+    legend.key.size = unit(10, "points")
+  ),
+  width = 5,
+  height = 9,
+  unit = "cm",
+  dpi = 300
+)
+```
+
+

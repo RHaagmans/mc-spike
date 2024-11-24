@@ -1,0 +1,361 @@
+---
+title: "Mock Community sequencing bias"
+author: "Rik Haagmans"
+date: "2024-08-20"
+output: html_document
+params:
+  output_dir: "../"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(params$output_dir))
+library(tidyverse)
+library(ggh4x)
+library(gt)
+source("helper_functions.R")
+source("data_files.R")
+```
+
+```{r load_data, message=FALSE}
+
+mc_depth <- load_depth_table(mc_readmap_depth_file)
+mc_coverage <- calculate_coverage(mc_depth)
+
+mc_depth <- left_join(
+  mc_depth,
+  mc_coverage %>% select(sample, ref, total_bp, covered, coverage),
+  by = join_by(sample, ref)
+  )  
+
+# Calculate mean coverage graphs
+mean_depth <- mc_depth %>%
+  filter(coverage > 0.8) %>% # Filter out samples with low coverage
+  group_by(rt_method, ref, bp) %>%
+  summarise(
+    depth_norm=mean(na.omit(depth_norm))
+    ) %>%
+  mutate(
+    sample="mean",
+    ref = factor(ref, levels=segment_order)
+    )
+
+mc_genome_stats <- load_sequence_stats(mc_genome_stats_file)
+
+mc_readmap_gc <- read_tsv(
+  mc_readmap_gc_file,
+  col_types = cols(
+    sample = col_factor(levels = full_sample_order),
+    base_sample = col_factor(levels = base_sample_order),
+    spike = col_factor(levels = spike_order),
+    rt_method = col_factor(levels = method_order),
+    replicate = col_factor(),
+    ref = col_factor(levels = segment_order),
+    avg_gc = col_number()
+  ),
+  show_col_types = FALSE
+) %>%
+  mutate(avg_gc = 100 * avg_gc) %>% 
+  left_join(mc_genome_stats %>% select(-ref_length), by = "ref") %>%
+  left_join(segment_to_virus, by = "ref") 
+
+```
+
+## Coverage depth
+
+```{r mc_depth_plot_function}
+plot_mc_depth_by_sample <- function(mc_depth) {
+  ggplot(
+    mc_depth,
+    aes(
+      x = bp / 1000,
+      y = 10000 * depth_norm,
+      color = paste0(base_sample, "-", spike)
+    )
+  ) +
+    geom_line(alpha = .5, linewidth = 0.3) +
+    nice_plot() +
+    facet_wrap( ~ ref, scales = 'free', ncol = 1) +
+    scale_x_continuous(expand = expansion(add = 0, mult = c(0, 0))) +
+    scale_y_continuous(expand = expansion(add = 0, mult = c(0, 0))) +
+    scale_color_manual(values = c(c("mean" = "#000000"), sample_palette)) +
+    labs(x = "position (kbase)",
+         y = expression(paste("fraction sequenced bases (", x, 10 ^ {-6}, ")")),
+         color = "")
+}
+
+mc_depth_HI_samples <- mc_depth %>%
+  filter(spike == "HI" &
+           ref %in% c("Det7", "T5", "P22", "MHV", "M13", "RV-A_s1") &
+           coverage > 0.8)
+```
+
+Coverage depth of viruses with at least 0.8X coverage in WTA2 libraries:
+
+```{r plot_depth_by_sample_WTA2}
+mc_depth_full_plot_w <-
+  plot_mc_depth_by_sample(mc_depth_HI_samples %>% filter(rt_method == "WTA2"))
+
+mc_depth_full_plot_w
+
+ggsave(
+  "figures/mc_bias/mc_depth_full_WTA2.png",
+  plot = mc_depth_full_plot_w + theme(legend.position = "bottom"),
+  width=16, height=20, unit="cm", dpi=300
+  )
+```
+
+Coverage depth of viruses with at least 0.8X coverage in SISPA libraries:
+
+```{r plot_depth_by_sample_SISPA}
+mc_depth_full_plot_s <-
+  plot_mc_depth_by_sample(mc_depth_HI_samples %>% filter(rt_method == "SISPA"))
+
+mc_depth_full_plot_s
+
+ggsave(
+  "figures/mc_bias/mc_depth_full_SISPA.png",
+  plot = mc_depth_full_plot_s + theme(legend.position = "bottom"),
+  width=16, height=20, unit="cm", dpi=300
+  )
+```
+
+Comparing the mean sequencing depth of WTA2 and SISPA libraries:
+
+```{r plot_depth_mean}
+mc_depth_full_sample_mean_plot <- ggplot(
+  mean_depth %>% filter(ref %in% c("Det7", "T5", "P22", "M13")),
+  aes(
+    x = bp / 1000,
+    y = 10000 * depth_norm,
+    color = rt_method
+  )
+) +
+  geom_line(
+    data = mc_depth_HI_samples %>% filter(ref %in% c("Det7", "T5", "P22", "M13")),
+    aes(group = base_sample),
+    color = "black",
+    alpha = 0.3,
+    linewidth = 0.2
+  ) +
+  geom_line() +
+  nice_plot() +
+  facet_nested(ref + rt_method ~ ., scales = 'free', independent = "x") +
+  scale_x_continuous(expand = expansion(add = 0, mult = c(0, 0))) +
+  scale_y_continuous(expand = expansion(add = 0, mult = c(0, 0))) +
+  scale_color_manual(values = method_palette) +
+  theme(
+    legend.margin = margin(0, 0, 0, 0),
+    strip.text = element_text(size = 9, face = "bold"),
+    axis.title.x = element_text(size = 10, face = "bold")
+  ) +
+  labs(x = "position (kbp)",
+       y = expression(paste("fraction sequenced bp (", x, 10 ^ {-6}, ")")),
+       color = "")
+mc_depth_full_sample_mean_plot
+
+ggsave(
+  "figures/mc_bias/mc_depth_means.png", 
+  plot = mc_depth_full_sample_mean_plot + theme(legend.position = "bottom"),
+  width=16, height=14, unit="cm", dpi=300
+  )
+
+
+```
+
+Comparing sequencing depth uniformity:
+
+```{r plot_depth_variation}
+mc_depth_variance <- mc_depth %>%
+  group_by(sample, base_sample, spike, rt_method, ref) %>%
+  summarise(
+    mean = mean(depth),
+    sd = sd(depth),
+    variance = sd ^ 2,
+    cv = sd / mean,
+    coverage = first(coverage)
+  )
+
+mc_dept_variance_plot <- ggplot(
+  mc_depth_variance %>%
+    filter(spike == "HI"),
+  aes(
+    y = ref,
+    x = cv,
+    color = rt_method,
+    shape = base_sample
+  )
+) +
+  geom_point() +
+  nice_plot() +
+  scale_y_discrete(limits = rev(segment_order))+
+  scale_color_manual(values = method_palette) +
+  scale_shape_manual(values = base_sample_shapes) +
+  xlim(0, 2.4) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.margin = margin(0, 0, 0, 0),
+    axis.title.y = element_blank()
+  ) +
+  labs(x = "coefficient of variation", color = "", shape = "")
+
+mc_dept_variance_plot
+
+ggsave(
+  "figures/mc_bias/mc_depth_variance.png",
+  plot = mc_dept_variance_plot +
+    guides(shape = guide_legend(nrow = 2)) +
+    guides(color = guide_legend(nrow = 2)),
+  width = 7,
+  height = 10,
+  unit = "cm",
+  dpi = 300
+)
+```
+
+## GC Content
+
+Variation in average GC content in relation to genome coverage:
+
+```{r plot_gc_deviation_vs_coverage}
+mc_gc_vs_cov_plot <- ggplot(
+  left_join(
+    mc_readmap_gc %>% filter(spike %in% c("HI", "LO")),
+    mc_coverage %>% select(sample, ref, coverage),
+    by = join_by(sample, ref)
+  ),
+  aes(
+    x = coverage,
+    y = avg_gc - ref_gc,
+    color = ref,
+    shape = base_sample
+  )
+) +
+  geom_vline(xintercept = .2,
+             color = "grey23",
+             linetype = "dashed") +
+  geom_point() +
+  nice_plot() +
+  colorscheme_virus_color +
+  scale_shape_manual(values = base_sample_shapes) +
+  facet_wrap( ~ rt_method) +
+  labs(color = "virus", y = "percentage points diference\nfrom genome %GC")
+
+mc_gc_vs_cov_plot
+
+ggsave(
+  "figures/mc_bias/mc_gc_vs_cov.png",
+  plot = mc_gc_vs_cov_plot,
+  width = 16, height = 8, units = "cm", dpi = 300
+)
+
+```
+
+Deviation of average GC content compared to actual genomic GC content:
+
+```{r plot_gc_deviation}
+ref_labels <- mc_genome_stats %>%
+  select(-ref_length) %>%
+  mutate(ref_label = paste0(ref, "\n(", ref_gc, "% GC)")) %>%
+  pull(ref_label, name = ref)
+
+mc_readmap_gc_highcov <- left_join(
+  mc_readmap_gc,
+  mc_coverage %>% select(sample, ref, coverage),
+  by=join_by(sample, ref)
+  ) %>%
+  filter(coverage > 0.2)
+
+mc_gc_bias_plot <- ggplot(
+  mc_readmap_gc_highcov %>%
+    filter(virus %in% c("T5", "Det7", "P22", "M13", "MHV", "BVDV")), 
+  aes(x = rt_method, y = avg_gc - ref_gc)
+  ) +
+  geom_hline(yintercept = 0,
+             color = "grey23",
+             linetype = 'dashed') +
+  geom_point(aes(color = virus, shape = base_sample)) +
+  facet_wrap(
+    ~ ref,
+    scales = "free_y",
+    ncol = 3,
+    labeller = as_labeller(ref_labels)
+  ) +
+  nice_plot() +
+  scale_y_continuous(limits = c(-2.5, 9)) +
+  scale_color_manual(values = virus_palette, guide = "none") +
+  scale_shape_manual(values = base_sample_shapes) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(1, 0),
+    legend.justification = c(1, 0),
+    legend.direction = "vertical",
+    strip.text = element_text(size = 9, face = "bold")
+  ) +
+  labs(x = "",
+       y = "percentage points difference\nfrom genome GC",
+       shape = "")
+
+mc_gc_bias_plot
+
+mc_gc_bias_RV_plot <- ggplot(
+  mc_readmap_gc_highcov %>% filter(virus == "RV-A"),
+  aes(x = ref, y = avg_gc)
+  ) +
+  geom_point(aes(shape = base_sample)) +
+  geom_point(aes(y = ref_gc, x = ref),
+             color = "red",
+             shape = 4) +
+  facet_grid( ~ rt_method, scales = "free", space = "free_x") +
+  nice_plot() +
+  scale_shape_manual(values = base_sample_shapes) +
+  theme(strip.text = element_text(size = 9, face = "bold")) +
+  rotate_x_text()+
+  labs(x = "",
+       y = "% GC",
+       shape = "")
+
+mc_gc_bias_RV_plot
+
+ggsave(
+  "figures/mc_bias/mc_gc_bias_non-RV-A.png",
+  plot = mc_gc_bias_plot,
+  width = 9, height = 10, units = "cm", dpi = 300
+)
+
+ggsave(
+  "figures/mc_bias/mc_gc_bias_RV-A.png",
+  plot = mc_gc_bias_RV_plot,
+  width = 16, height = 8, units = "cm", dpi = 300
+)
+```
+
+```{r stats_non_rva}
+mc_readmap_gc_highcov %>% 
+  filter(virus %in% c("T5", "Det7", "P22", "M13", "MHV", "BVDV")) %>% 
+  select(sample, ref, avg_gc, ref_gc) %>% 
+  pivot_wider(id_cols = c(ref, ref_gc), names_from = sample, values_from = avg_gc) %>% 
+  arrange(ref_gc) %>% 
+  gt() %>% 
+  fmt_percent(-ref, decimals = 2, scale_values = FALSE) %>% 
+  tab_spanner(label = "WTA2", ends_with("-WTA2")) %>% 
+  tab_spanner(label = "SISPA", ends_with("-SISPA"))
+
+
+```
+
+
+
+```{r stats_rva}
+mc_readmap_gc_highcov %>% filter(virus == "RV-A") %>% 
+  select(sample, ref, avg_gc, ref_gc) %>% 
+  pivot_wider(id_cols = c(ref, ref_gc), names_from = sample, values_from = avg_gc) %>% 
+  arrange(ref_gc) %>% 
+  gt() %>% 
+  fmt_percent(-ref, decimals = 2, scale_values = FALSE) %>% 
+  tab_spanner(label = "WTA2", ends_with("-WTA2")) %>% 
+  tab_spanner(label = "SISPA", ends_with("-SISPA"))
+  
+
+```

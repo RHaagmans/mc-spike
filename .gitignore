@@ -1,0 +1,16 @@
+.git/
+.idea/
+.snakemake/
+.Rproj.user/
+data/
+dbs/
+logs/
+reads/
+reports/
+figures/
+envs/*.img
+envs/*.sif
+*.Rproj
+*.code-workspace
+.Rhistory
+.RData

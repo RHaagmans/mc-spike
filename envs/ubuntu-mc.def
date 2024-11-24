@@ -1,0 +1,31 @@
+# Install using APT (Ubuntu)
+Bootstrap: docker
+From: ubuntu:jammy
+
+%files
+ubuntu-mc-environment.yml
+
+%environment
+export DEBCONF_FRONTEND=noninteractive
+export LANG=en_GB.UTF-8
+export LC_ALL=en_GB.UTF-8
+export PATH=/opt/miniforge3/bin:$PATH
+
+%post
+apt update
+apt-get -y upgrade
+
+apt-get -y install locales wget
+
+locale-gen en_GB.UTF-8
+update-locale en_GB.UTF-8
+
+wget https://github.com/conda-forge/miniforge/releases/download/24.3.0-0/Miniforge3-24.3.0-0-Linux-x86_64.sh
+bash Miniforge3-24.3.0-0-Linux-x86_64.sh -b -p /opt/miniforge3
+
+/opt/miniforge3/bin/conda init
+export PATH=/opt/miniforge3/bin:$PATH
+
+echo ". /opt/miniforge3/etc/profile.d/conda.sh" >> $SINGULARITY_ENVIRONMENT
+echo "conda activate mc" >> $SINGULARITY_ENVIRONMENT
+mamba env create -n mc --file ./ubuntu-mc-environment.yml

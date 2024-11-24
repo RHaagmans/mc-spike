@@ -1,0 +1,679 @@
+---
+title: "Read and assembly stats"
+author: "Rik Haagmans"
+date: "2024-08-03"
+output: html_document
+params:
+  output_dir: "../"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(params$output_dir))
+library(tidyverse)
+library(gt)
+source("helper_functions.R")
+source("data_files.R")
+```
+
+```{r load_sample_metadata}
+sample_sheet = load_sample_sheet(sample_sheet_file) %>% 
+  select(-fw_readfile, -rv_readfile)
+```
+
+# Read statistics
+
+```{r load_read_stats, echo = FALSE, message = FALSE, warning = TRUE}
+read_stats <- read_tsv(read_stats_file) %>% 
+  mutate(
+    filter_step = factor(filter_step, levels = c("pre-qc", "post-qc", "viral")),
+    library_name = factor(library_name),
+    sample_name = factor(sample_name, levels=sample_order),
+    rt_method = factor(rt_method, levels = method_order),
+    spike = factor(spike, levels = c(spike_order)),
+    base_sample = factor(base_sample, levels = base_sample_order)
+  )
+
+read_duplication <- read_tsv(read_duplication_rate_file) %>% 
+  left_join(
+    sample_sheet %>% select(-assembly, -coassembly) %>% mutate(spiked_sample = paste0(base_sample, "-", spike))
+  )  
+```
+
+
+## Read stats
+
+Number of reads and bases and GC-content per sample:
+
+```{r}
+gt(
+  read_stats %>%
+    arrange(filter_step) %>%
+    select(-library_name, -sample_name) %>%
+    mutate(across(where(is.factor), as.character)),
+  groupname_col = "filter_step"
+) %>% 
+  fmt_number(n_reads, decimals = 0) %>% 
+  fmt_scientific(total_bp, decimals = 3)
+```
+
+### Comparing WTA2 and SISPA
+
+Number of reads per sample:
+
+```{r print_readstats, echo=FALSE}
+read_stats %>% 
+  select(base_sample, spike, rt_method, filter_step, n_reads) %>%
+  pivot_wider(names_from = filter_step, values_from = n_reads) %>%
+  rename(n_reads = `pre-qc` ) %>% 
+  group_by(rt_method) %>% 
+  summarise(
+    mean = mean(n_reads),
+    min = min(n_reads),
+    max = max(n_reads),
+    median = median(n_reads)
+  ) %>%
+  gt
+```
+
+Percent removed by quality filtering:
+
+```{r reads_reduction, echo=FALSE}
+read_stats %>% 
+  select(base_sample, spike, rt_method, filter_step, n_reads) %>%
+  pivot_wider(names_from = filter_step, values_from = n_reads) %>%
+  mutate(perc_reduction = (100 * (`pre-qc`-`post-qc`)/`pre-qc`)) %>%
+  group_by(rt_method) %>%
+  summarise(
+    mean = mean(perc_reduction),
+    min = min(perc_reduction),
+    max = max(perc_reduction),
+    median = median(perc_reduction)
+  ) %>%
+  gt
+```
+
+Average read length:
+
+```{r reads_avg_length, echo=FALSE}
+read_stats %>% 
+  select(base_sample, spike, rt_method, filter_step, mean_length) %>%
+  group_by(rt_method) %>%
+  summarise(
+    mean = mean(mean_length),
+    min = min(mean_length),
+    max = max(mean_length),
+    median = median(mean_length)
+  ) %>%
+  gt
+```
+
+Average GC-content:
+
+```{r reads_avg_gc, echo=FALSE}
+read_stats %>% 
+  select(base_sample, spike, rt_method, filter_step, mean_gc) %>%
+  group_by(rt_method) %>%
+  summarise(
+    mean = mean(mean_gc),
+    min = min(mean_gc),
+    max = max(mean_gc),
+    median = median(mean_gc)
+  ) %>%
+  gt
+```
+
+### Read count and sequencing depth:
+
+```{r plot_read_stats, echo=FALSE}
+ggplot(
+  read_stats %>% mutate(
+    filter_step = fct_recode(
+      filter_step,
+      "Raw reads" = "pre-qc",
+      "High-quality reads" = "post-qc"
+    )
+  ),
+  aes(x = spike, y = n_reads / 10 ^ 6, fill = filter_step)
+) +
+  geom_bar(stat = "identity", position = "dodge") +
+  nice_plot() +
+  scale_y_continuous(expand = nice_scale_expansion) +
+  scale_fill_manual(values = c(pal_cat[1], pal_cat[3])) +
+  facet_grid(rt_method ~ base_sample, scales = "free_x", space = "free_x") +
+  theme(strip.text = element_text(size = 9, face = "bold"),
+        legend.position = "bottom") +
+  labs(x = "MC spike", y = "million reads", fill = "")
+
+ggsave(
+  "figures/read_and_contig_stats/read_count.png",
+  width = 10, height = 8, units = "cm", dpi = 300
+)
+
+
+ggplot(read_stats %>% mutate(
+    filter_step = fct_recode(
+      filter_step,
+      "Raw reads" = "pre-qc",
+      "High-quality reads" = "post-qc"
+    )
+  ),
+       aes(x = spike, y = total_bp / 10 ^ 9, fill = filter_step)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  nice_plot() +
+  scale_y_continuous(expand = nice_scale_expansion) +
+  scale_fill_manual(values = c(pal_cat[2], pal_cat[4])) +
+  facet_grid(rt_method ~ base_sample, scales = "free_x", space = "free_x") +
+  theme(strip.text = element_text(size = 9, face = "bold"),
+        legend.position = "bottom") +
+  labs(y = "depth (Gbp)", fill = "", x = "MC spike")
+
+ggsave(
+  "figures/read_and_contig_stats/read_depth.png",
+  width = 10, height = 8, units = "cm", dpi = 300
+)
+```
+
+### Duplication rate
+
+```{r plot_duplication_rate}
+ggplot(
+  read_duplication,
+  aes(x = n_reads / 10^6, y = 100 * dup_reads/n_reads, color = spiked_sample)
+  )+
+  geom_line()+
+  nice_plot()+
+  facet_grid(.~rt_method)+
+  scale_y_continuous(expand = nice_scale_expansion)+
+  scale_color_manual(values = sample_palette)+
+  labs(x = "reads (million)", y = "% duplicate reads", color = "sample")
+
+ggsave(
+  "figures/read_and_contig_stats/read_duplication_rate.png",
+  width = 16, height = 10, units = "cm", dpi = 300
+)
+
+```
+
+```{r stats_duplication_rate}
+read_duplication %>% 
+  mutate(p_dup = 100 * dup_reads/n_reads) %>% 
+  group_by(base_sample, spike, rt_method) %>% 
+  summarise(
+    dup_1M_r = p_dup[n_reads == 1 * 10^6],
+    dup_5M_r = p_dup[n_reads == 5 * 10^6],
+    dup_max = max(p_dup)
+  )
+
+read_duplication %>% 
+  mutate(p_dup = 100 * dup_reads/n_reads) %>% 
+  group_by(base_sample, spike, rt_method) %>% 
+  summarise(
+    dup_max = max(p_dup)
+  ) %>% 
+  pivot_wider(names_from = rt_method, values_from = dup_max) %>% 
+  ungroup() %>% 
+  summarise(
+    min_WTA2= min(WTA2),
+    max_WTA2 = max(WTA2),
+    min_SISPA = min(SISPA),
+    max_SISPA = max(SISPA)
+  )
+
+
+```
+
+## Assembly statistics
+
+```{r load_assembly_stats, echo=FALSE, message=FALSE}
+quast_stats_assembly <- load_quast_stats(quast_assembly_file)
+quast_stats_coassembly <- load_quast_stats(quast_coassembly_file)
+
+seqkit_stats_assembly <- read_tsv(seqkit_assembly_file) %>% 
+  rename(assembly = file) %>% 
+  mutate(
+    stage = factor(stage, levels = c("raw", "dereplicated", "viral")),
+    stage = fct_recode(stage, "assembly" = "raw", "derep" = "dereplicated", "vir" = "viral")
+  ) %>% 
+  select(assembly, stage, num_seqs, sum_len, N50, N50_num, `GC(%)`, max_len)%>% 
+  add_assembly_meta(sample_sheet)
+
+seqkit_stats_coassembly <- read_tsv(seqkit_coassembly_file) %>% 
+  rename(assembly = file) %>% 
+  mutate(
+    stage = factor(stage, levels = c("raw", "dereplicated", "viral")),
+    stage = fct_recode(stage, "assembly" = "raw", "derep" = "dereplicated", "vir" = "viral")
+  ) %>% 
+  select(assembly, stage, num_seqs, sum_len, N50, N50_num, `GC(%)`, max_len)  %>% 
+  add_coassembly_meta(sample_sheet)
+
+assembly_stats  <- left_join(
+  seqkit_stats_assembly, 
+  quast_stats_assembly %>% select(assembly, stage, n_contigs_10k), 
+  by = c("assembly", "stage")) %>% 
+  arrange(assembly, stage)
+  
+coassembly_stats  <- left_join(
+  seqkit_stats_coassembly, 
+  quast_stats_coassembly %>% select(assembly, stage, n_contigs_10k), 
+  by = c("assembly", "stage")) %>% 
+  arrange(assembly, stage)
+
+contig_stats_assembly <-  load_contig_stats(assembly_contig_stats_file) %>% 
+  add_assembly_meta(sample_sheet)
+
+assembly_coverage <- load_coverage(assembly_coverage_file)
+
+checkv_assembly_stats <- load_checkv_data(assembly_checkv_results_file)
+checkv_coassembly_stats <- load_checkv_data(coassembly_checkv_results_file)
+```
+
+Assembly statistics:
+
+```{r stats_assembly, message=FALSE, echo=FALSE }
+gt(assembly_stats)
+
+gt(assembly_stats %>%
+     filter(stage == "assembly") %>% 
+     relocate(base_sample, spike, rt_method) %>% 
+     relocate(n_contigs_10k, num_seqs, sum_len, `GC(%)`, N50, N50_num, .after=rt_method) %>% 
+     select(-assembly, -stage) %>% 
+     mutate(
+       rt_method = factor(rt_method, levels = method_order),
+       num_seqs = num_seqs / 1000,
+       sum_len = sum_len / 10^6,
+       `GC(%)` = `GC(%)` / 100
+       ) %>% 
+     arrange(rt_method, base_sample),
+   groupname_col = "rt_method"
+) %>% 
+  fmt_number(c(n_contigs_10k, N50, N50_num), decimals = 0) %>% 
+  fmt_number(c(num_seqs, sum_len), decimals = 1) %>% 
+  fmt_percent(`GC(%)`, decimals = 2) %>% 
+  cols_label(
+    base_sample = "Sample",
+    spike = "Spike",
+    n_contigs_10k  = "# contigs (≥10 kbp)",
+    num_seqs = "# contigs(x1000)",
+    sum_len = "Total length (Mbp)",
+    `GC(%)` = "GC (%)",
+    N50 = "N50 (bp)",
+    N50_num = "L50 (#)"
+  )
+```
+
+Comparing SISPA to WTA2:
+
+```{r stats_assembly_wta2_sispa}
+
+assembly_stats %>%
+     filter(stage == "assembly") %>% 
+     relocate(base_sample, spike, rt_method) %>% 
+     relocate(n_contigs_10k, num_seqs, .after=rt_method) %>% 
+     select(-c(assembly, stage, , sum_len, `GC(%)`, N50, N50_num)) %>% 
+     mutate(
+       rt_method = factor(rt_method, levels = method_order),
+       num_seqs = num_seqs / 1000
+       ) %>% 
+     arrange(rt_method, base_sample) %>% 
+  pivot_wider(names_from= rt_method, values_from = c(n_contigs_10k, num_seqs)) %>% 
+  mutate(
+    p_num_seqs_SISPA = (num_seqs_WTA2 - num_seqs_SISPA) / num_seqs_WTA2,
+    p_n_contigs_10k_SISPA= (n_contigs_10k_WTA2 - n_contigs_10k_SISPA) / n_contigs_10k_WTA2,
+  ) %>% 
+  arrange(
+    p_num_seqs_SISPA
+  )
+
+
+```
+
+```{r stats_assembly_largest_ctg}
+
+seqkit_stats_assembly %>% 
+  filter(stage == "assembly") %>% 
+  select(base_sample, spike, rt_method, max_len) %>% 
+  pivot_wider(names_from = rt_method, values_from = max_len) 
+
+```
+
+```{r stats_assembly_sum_len}
+
+seqkit_stats_assembly %>% 
+  filter(stage == "assembly") %>% 
+  select(base_sample, spike, rt_method, sum_len) %>% 
+  pivot_wider(names_from = rt_method, values_from = sum_len) %>% 
+  mutate(
+    p_sumlen_SISPA = (WTA2 - SISPA) / WTA2
+  ) %>% 
+  arrange(
+    p_sumlen_SISPA
+  )
+
+
+seqkit_stats_assembly %>% 
+  filter(stage == "assembly") %>% 
+  select(base_sample, spike, rt_method, sum_len) %>% 
+  group_by(rt_method) %>% 
+  summarise(
+    min_sumlen = min(sum_len),
+    max_sumlen = max(sum_len)
+  )
+
+```
+
+```{r stats_longest_contigs}
+assembly_coverage %>% 
+  select(base_sample, spike, rt_method, contig, endpos) %>% 
+  group_by(base_sample, spike, rt_method) %>% 
+  slice_max(endpos, n = 250) %>% 
+  summarise(
+    mean_length = mean(endpos)
+  ) %>% 
+  pivot_wider(names_from = rt_method, values_from = mean_length) %>% 
+  filter(base_sample %in% base_sample_faecal) %>% 
+  mutate(f_SISPA = WTA2/SISPA) %>% 
+  arrange(f_SISPA)
+
+```
+
+
+```{r stats_assembly_cov}
+
+assembly_coverage %>% 
+  group_by(base_sample, spike, rt_method) %>% 
+  summarise(
+    mean_depth = sum(meandepth * endpos) / sum(endpos)
+  ) %>% 
+  pivot_wider(names_from=rt_method, values_from = mean_depth) %>% 
+  mutate(
+    f_WTA2 = SISPA/WTA2,
+    p_WTA2 = (SISPA - WTA2) / SISPA
+  ) %>% 
+  arrange(f_WTA2)
+
+```
+
+Co-assembly statistics:
+
+```{r print_coassembly_stats, echo=FALSE}
+gt(quast_stats_coassembly)
+```
+
+Number of contigs per refinement stage:
+
+```{r assembly_contigs_by_step, echo=FALSE}
+assembly_stats_ncontigs <-  quast_stats_assembly %>%
+  add_assembly_meta(sample_sheet) %>%
+  select(base_sample, spike, rt_method, stage, n_contigs) %>%
+  pivot_wider(names_from = stage, values_from = n_contigs) %>%
+  mutate(assembly = assembly - derep,
+         derep = derep - vir) %>%
+  rename(
+    duplicate = assembly,
+    unique_nonviral = derep,
+    unique_viral = vir
+  ) %>%
+  pivot_longer(
+    cols = c(duplicate, unique_nonviral, unique_viral),
+    names_to = "stage",
+    values_to = "n_contigs"
+  )
+
+assembly_stats_totlen <-  quast_stats_assembly %>%
+  add_assembly_meta(sample_sheet) %>%
+  select(base_sample, spike, rt_method, stage, total_length) %>%
+  pivot_wider(names_from = stage, values_from = total_length) %>%
+  mutate(assembly = assembly - derep,
+         derep = derep - vir) %>%
+  rename(
+    duplicate = assembly,
+    unique_nonviral = derep,
+    unique_viral = vir
+  ) %>%
+  pivot_longer(
+    cols = c(duplicate, unique_nonviral, unique_viral),
+    names_to = "stage",
+    values_to = "total_length"
+  )
+
+ggarrange(
+  ggplot(
+    assembly_stats_ncontigs,
+    aes(x = paste0(base_sample, "-", spike), y = n_contigs, fill = stage)
+  ) +
+    geom_bar(stat = "identity")+
+    nice_plot()+
+    scale_y_continuous(expand = nice_scale_expansion)+
+    scale_fill_manual(values = assembly_qc_stage_colors) +
+    facet_wrap(~rt_method)+
+    rotate_x_text()+
+    labs(x = "sample", y = "# contigs", fill = ""),
+
+  ggplot(
+    assembly_stats_ncontigs,
+    aes(x = paste0(base_sample, "-", spike), y = n_contigs, fill = stage)
+  ) +
+    geom_bar(stat = "identity", position = "fill")+
+    nice_plot() +
+    scale_y_continuous(expand = nice_scale_expansion_zero)+
+    scale_fill_manual(values = assembly_qc_stage_colors) +
+    facet_wrap(~rt_method)+
+    rotate_x_text() +
+    labs(x = "sample", y = "% contigs", fill = ""),
+  ncol = 2,
+  common.legend = TRUE,
+  legend = "bottom"
+)
+ggsave(
+  "figures/read_and_contig_stats/assembly_contig_count_by_stage.png",
+  width = 16, height = 7, units = "cm", dpi = 300
+)
+```
+
+Total assembly length:
+
+```{r assembly_length_by_step, echo=FALSE}
+ggarrange(
+  ggplot(
+    assembly_stats_totlen,
+    aes(x = paste0(base_sample, "-", spike), y = total_length / 10^9, fill = stage)
+  ) +
+    geom_bar(stat = "identity")+
+    nice_plot()+
+    scale_y_continuous(expand = nice_scale_expansion)+
+    scale_fill_manual(values = assembly_qc_stage_colors) +
+    facet_wrap(~rt_method)+
+    rotate_x_text()+
+    labs(x = "sample", y = "Gbp", fill = ""),
+
+  ggplot(
+    assembly_stats_totlen,
+    aes(x = paste0(base_sample, "-", spike), y = total_length, fill = stage)
+  ) +
+    geom_bar(stat = "identity", position = "fill")+
+    nice_plot() +
+    scale_y_continuous(expand = nice_scale_expansion_zero)+
+    scale_fill_manual(values = assembly_qc_stage_colors) +
+    facet_wrap(~rt_method)+
+    rotate_x_text()+
+    labs(x = "sample", y = "% bp", fill = ""),
+  ncol = 2,
+  common.legend = TRUE,
+  legend = "bottom"
+)
+
+ggsave(
+  "figures/read_and_contig_stats/assembly_length_by_stage.png",
+  width = 16, height = 7, units = "cm", dpi = 300
+)
+```
+
+Contigs in each assembly after dereplication at 95% ANI over 80% of shortest sequence:
+
+```{r assembly_stats_plot, echo=FALSE, message=FALSE}
+assembly_contig_count <- ggplot(
+    quast_stats_assembly %>%
+      separate(assembly, into=c("base_sample", "spike", "rt_method")) %>% 
+      filter(stage == "derep") %>%  
+      mutate(
+        sample=factor(paste0(base_sample, "-", spike), levels = sample_order )
+        ),
+    aes(x = rt_method, y = n_contigs/1000, fill = sample)
+    )+
+    geom_bar(
+      stat = "identity",
+      position = position_dodge2(width = 0.9, preserve = "single")
+      )+
+  nice_plot()+
+  scale_y_continuous(expand = nice_scale_expansion)+
+  scale_fill_manual(values = sample_palette)+
+  theme(legend.position = "bottom", legend.key.size = unit(0.5, "line")) + 
+  nice_legend_tight_y +
+  labs(x="", y="x 1000 contigs", fill = "", title = "contigs ≥500 bp")
+
+assembly_contig_count_10k <- ggplot(
+    quast_stats_assembly %>%
+      separate(assembly, into=c("base_sample", "spike", "rt_method"))%>% 
+      filter(stage == "derep") %>%  
+      mutate(
+        sample=factor(paste0(base_sample, "-", spike), levels = sample_order )
+        ),
+    aes(x = rt_method, y = n_contigs/1000, fill = sample)
+    )+
+    geom_bar(
+      stat = "identity",
+      position = position_dodge2(width = 0.9, preserve = "single")
+      )+
+  nice_plot()+
+  scale_y_continuous(expand = nice_scale_expansion)+
+  scale_fill_manual(values = sample_palette)+
+  theme(legend.position = "bottom", legend.key.size = unit(0.5, "line")) +
+  nice_legend_tight_y +
+  labs(x="", y="contigs", fill = "", title = "contigs ≥10 kbp")
+
+assembly_contig_stats <- ggarrange(
+  assembly_contig_count,
+  assembly_contig_count_10k,
+  nrow=1,
+  common.legend = TRUE,
+  legend = "bottom"
+)
+
+assembly_contig_stats
+
+ggsave(
+  "figures/read_and_contig_stats/contig_counts.png",
+  plot = assembly_contig_stats,
+  width = 16, height = 7, units = "cm", dpi = 300
+)
+```
+
+
+```{r assembly_cumulative_length}
+assembly_contig_cumlen <- ggplot(
+  contig_stats_assembly %>% filter(base_sample != "SBL"),
+  aes(
+    x = contig_idx,
+    y = cum_length,
+    color = factor(paste0(base_sample, "-", spike), levels = sample_order),
+    group = assembly
+  )
+) +
+  geom_line() +
+  facet_wrap( ~ rt_method, nrow = 1) +
+  nice_plot() +
+  scale_y_continuous(expand = nice_scale_expansion) +
+  scale_color_manual(values = sample_palette) +
+  guides(color = guide_legend(ncol = 2)) +
+  theme(legend.position = "right") +
+  labs(
+    x = "contig ID",
+    y = "cumulative length",
+    color = "sample",
+    linetype = "RT method"
+  )
+
+assembly_contig_cumlen
+
+ggsave(
+  "figures/read_and_contig_stats/assembly_cumulative_length.png",
+  plot = assembly_contig_cumlen,
+  width = 16, height = 6, units = "cm", dpi = 300
+)
+```
+
+```{r assembly_contig_quality}
+
+assembly_contig_quality <- ggplot(
+  checkv_assembly_stats %>%
+    add_assembly_meta(sample_sheet) %>% 
+    group_by(base_sample, spike, rt_method, checkv_quality) %>%
+    summarise(
+      checkv_quality_num = first(checkv_quality_num),
+      n = n()
+    ) %>%
+    group_by(base_sample, spike, rt_method) %>%
+    mutate(perc_contigs = n / sum(n)) %>%
+    filter(checkv_quality_num > 1),
+  aes(x = paste0(base_sample, "-", spike), y = perc_contigs, fill = checkv_quality)
+) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap( ~ rt_method) +
+  nice_plot() +
+  scale_y_continuous(expand = nice_scale_expansion) +
+  scale_fill_manual(values = checkv_quality_palette) +
+  labs(x = "assembly", y = "% contigs", fill = "CheckV quality")
+
+assembly_contig_quality
+
+ggsave(
+  "figures/read_and_contig_stats/contig_quality_assembly.png",
+  plot = assembly_contig_quality,
+  width = 12, height = 6, units = "cm", dpi = 300
+)
+```
+
+
+```{r coassembly_contig_quality}
+
+coassembly_contig_quality <- ggplot(
+  checkv_coassembly_stats %>%
+    add_coassembly_meta(sample_sheet) %>% 
+    group_by(base_sample, rt_method, checkv_quality) %>%
+    summarise(
+      checkv_quality_num = first(checkv_quality_num),
+      n = n()
+    ) %>%
+    group_by(base_sample, rt_method) %>%
+    mutate(perc_contigs = n / sum(n)) %>%
+    filter(checkv_quality_num > 1),
+  aes(x = base_sample, y = perc_contigs, fill = checkv_quality)
+) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap( ~ rt_method) +
+  nice_plot() +
+  scale_y_continuous(expand = nice_scale_expansion) +
+  scale_fill_manual(values = checkv_quality_palette) +
+  labs(x = "co-assembly", y = "% contigs", fill = "CheckV quality")
+
+coassembly_contig_quality
+
+ggsave(
+  "figures/read_and_contig_stats/contig_quality_coassembly.png",
+  plot = coassembly_contig_quality,
+  width = 12, height = 6, units = "cm", dpi = 300
+)
+
+```
+
+```{r stat_coassembly_quality}
+
+checkv_coassembly_stats %>% 
+  group_by(assembly, checkv_quality) %>% 
+  summarise(
+    n_contigs = n(),
+  )
+
+
+```

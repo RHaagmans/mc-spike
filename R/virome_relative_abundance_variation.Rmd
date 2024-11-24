@@ -1,0 +1,1107 @@
+---
+title: "Virome relative abundance variation"
+author: "Rik Haagmans"
+date: "2024-08-23"
+output: html_document
+params:
+  output_dir: "../"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(params$output_dir))
+library(tidyverse)
+library(ggExtra)
+library(ggpubr)
+library(gt)
+library(ggh4x)
+source("helper_functions.R")
+source("data_files.R")
+
+mc_blast_min_cov <- 95
+mc_blast_min_ani <- 98
+```
+
+```{r load_data, message = FALSE}
+virome_idxstats <- load_idxstats(coassembly_idxstats_file)
+virome_idxstats_summary <- summarise_idxstats(virome_idxstats)
+
+virome_coverage <- load_coverage(coassembly_coverage_file) %>% 
+  select(-startpos, meanbaseq, meanmapq)
+
+virome_mean_coverage <- virome_coverage %>% 
+  group_by(assembly, base_sample, rt_method, contig) %>% 
+  summarise(
+    mean_cov = mean(coverage),
+    mean_depth = mean(meandepth),
+    mean_depth_log = log10(mean_depth),
+  ) %>% 
+  mutate(
+    lcd_hcd = if_else(mean_depth < 10, "LCD", "HCD")
+  )
+
+virome_genomad_results <- load_genomad(coassembly_genomad_results_file) %>%
+  # 0.8 = conservative minimum score according to geNomad manual    
+  filter(topology != "Provirus" & virus_score > 0.8)
+
+virome_checkv_results <- load_checkv_data(coassembly_checkv_results_file)
+
+mc_contigs <- load_blast_ani_results(coassembly_mcblast_results_file) %>%
+  filter(qcov >= mc_blast_min_cov & ani >= mc_blast_min_ani)
+
+
+virome_classifications <-
+  virome_idxstats %>% rename(contig = ref) %>%
+  distinct(assembly, contig) %>%
+  left_join(
+    mc_contigs %>% 
+      select(assembly, contig) %>% mutate(is_mock = T),
+    by = c("assembly", "contig"),
+    
+  ) %>%
+  left_join(
+    virome_genomad_results %>% 
+      select(assembly, contig) %>% mutate(is_viral = T),
+    by = c("assembly", "contig")
+  ) %>%
+  left_join(
+    virome_checkv_results %>% 
+      select(assembly, contig, checkv_quality, checkv_quality_num, completeness),
+    by = c("assembly", "contig")
+  ) %>%
+  mutate(
+    is_mock = replace_na(is_mock, F),
+    is_viral = replace_na(is_viral, F),
+    contig_class = case_when(
+      is_mock ~ contig_classifications[["mc"]],
+      (is_viral & !is_mock) ~ contig_classifications[["endo"]],
+      (!is_viral & !is_mock) ~ contig_classifications[["unsure"]]
+    ),
+    contig_class = factor(contig_class, levels = contig_classifications)
+  )
+
+coassembly_contig_stats <- read_tsv(coassembly_contig_stats_file)
+
+virome_abundance_classification <- virome_idxstats %>%
+  rename(contig = ref) %>%
+  relocate(contig, length, .before = sample) %>% 
+  left_join(
+    virome_classifications,
+    by = c("assembly", "contig")
+  )
+
+virome_replicate_abundances <- virome_abundance_classification %>%
+  pivot_wider(
+    id_cols = c(
+      assembly,
+      base_sample,
+      rt_method,
+      contig,
+      length,
+      is_mock,
+      is_viral,
+      contig_class
+    ),
+    names_from = spike,
+    values_from = rpkm
+  )
+
+faecal_virome_abundance <- virome_abundance_classification %>%
+  filter(contig_class == contig_classifications[["endo"]]) %>% 
+  group_by(assembly, sample) %>%
+  mutate(
+    tot_reads_vir = sum(mapped_reads),
+    frac_reads_vir = mapped_reads / tot_reads_vir,
+    rpkm_vir = mapped_reads / (length / 10^3) / (tot_reads_vir / 10^6),
+    tot_rpkm_vir = sum(rpkm_vir),
+    relab_vir = 100 * rpkm_vir / sum(rpkm_vir)
+  )  %>% 
+  arrange(
+    desc(rpkm_vir), .by_group = TRUE
+    ) %>%
+  mutate(
+    rank = row_number(),
+    n_contigs = n()
+    )
+
+faecal_virome_abundance_summary <- faecal_virome_abundance %>%
+  arrange(assembly, sample, desc(rpkm_vir)) %>%
+  group_by(assembly, base_sample, rt_method, contig) %>%
+  summarise(
+    length = first(length),
+    n_contigs = first(n_contigs),
+    completeness = first(completeness),
+    checkv_quality = first(checkv_quality),
+    rank_mean = mean(rank),
+    rank_min = min(rank),
+    rank_max = max(rank),
+    rank_range = rank_max - rank_min,
+    rank_range_norm = rank_range / n_contigs,
+    rpkm_mean = sum(mapped_reads) / (length / 10^3) / sum(tot_reads_vir / 10^6),
+    rpkm_min = min(rpkm_vir),
+    rpkm_max = max(rpkm_vir),
+    rpkm_range = rpkm_max - rpkm_min,
+    rpkm_range_log = log10(rpkm_range),
+    rpkm_fd = max(rpkm_vir) / min(rpkm_vir),
+    rpkm_log10fd = log10(rpkm_fd),
+    rpkm_log2fd = log2(rpkm_fd),
+    relab_mean = 100 * sum(rpkm_vir) / sum(tot_rpkm_vir),
+    relab_min = min(relab_vir),
+    relab_max = max(relab_vir),
+    relab_range = relab_max - relab_min,
+    relab_fd = relab_max / relab_min,
+    relab_log2fd = log2(relab_fd),
+    present_in_all = prod(rpkm_vir) != 0,
+    .groups = 'keep'
+  ) %>%
+  left_join(
+    virome_mean_coverage,
+    by = c("assembly", "base_sample", "rt_method", "contig")
+    )
+
+faecal_virome_contig_ranks <- faecal_virome_abundance_summary %>% 
+  filter(present_in_all)
+
+```
+
+
+Contig length compared to the mean depth of the contig across the replicates:
+
+```{r plot_length_vs_abundance}
+virome_length_rpkm_plot <- ggplot(
+  faecal_virome_contig_ranks %>% arrange(rpkm_range_log),
+  aes(
+    x = length / 1000,
+    y = log10(mean_depth),
+    color = log2(rpkm_max / rpkm_min)
+  )
+) +
+  geom_point(size = 0.5, alpha = 0.5) +
+  nice_plot() +
+  scale_x_log10() +
+  scale_color_viridis_c(option = "magma") +
+  labs(x = "contig length (kb)",
+       y = "mean coverage depth (log10)",
+       color = "range abundance\n[log2(RPKM_max/RPKM_min)]") +
+  facet_grid(rt_method ~ base_sample) +
+  theme(
+    aspect.ratio = 1,
+    panel.grid = element_line(color = "#aaaaaa", linewidth = 0.1),
+    plot.background = element_rect(fill = 'transparent', color = NA),
+    legend.position = "bottom",
+    legend.key.height = unit(0.3, "cm"),
+  )
+
+virome_length_rpkm_plot
+
+ggsave(
+  "figures/virome_variation/contig_length_vs_rpkm.png",
+  plot = virome_length_rpkm_plot + guides(shape = guide_legend(nrow = 2)),
+  width = 16, height = 12, unit = "cm", dpi = 300
+  )
+```
+
+```{r stats_cov_vs_fdrpkm}
+faecal_virome_contig_ranks %>% 
+  group_by(rt_method) %>% 
+  summarise(
+    median_fd_LCD = median(rpkm_fd[mean_depth < 10]),
+    median_fd_HCD = median(rpkm_fd[mean_depth >= 10])
+  )
+
+```
+
+## Variation in rank and relative abundance
+
+Relative abundance of contigs in the HI and LO replicate:
+
+```{r plot_virome_abundance_HI_vs_LO}
+ax_min <- -2.2
+ax_max <- 5.5
+hundred_line <- data.frame(x = seq(ax_min,ax_max - 2,0.05)) 
+
+virome_abundance_hi_vs_lo <- ggplot(
+  virome_replicate_abundances %>% arrange(contig_class),
+  aes(
+    y = log10(HI),
+    x = log10(LO),
+    color = contig_class
+  )
+) +
+  geom_point(size = 0.1, alpha = 0.5) +
+  geom_line(
+    data = hundred_line,
+    aes(x = x, y = x + 2),
+    color = "grey23",
+    linetype = "dotted"
+  ) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    color = "black",
+    linetype = "solid"
+  ) +
+  nice_plot() +
+  xlim(ax_min, ax_max) +
+  ylim(ax_min, ax_max) +
+  scale_color_manual(name = "contig\nclassification",
+                     values = virclass_palette,
+                     guide = guide_legend(override.aes = c(size = 3))) +
+  labs(color = "sample",
+       x = "LO sample\nabundance [log10(RPKM)]",
+       y = "HI sample\nabundance [log10(RPKM)]") +
+  facet_grid(rt_method ~ base_sample) +
+  theme(
+    aspect.ratio = 1,
+    strip.text = element_text(size = 9, face = "bold"),
+    panel.grid = element_line(color = "#aaaaaa", linewidth = 0.1),
+    plot.background = element_rect(fill = 'transparent', color = NA),
+    legend.position = "bottom",
+  )
+
+virome_abundance_hi_vs_lo
+
+ggsave(
+  "figures/virome_variation/relab_hi_vs_lo-log10.png", 
+  plot = virome_abundance_hi_vs_lo,
+  width = 16, height = 12, unit = "cm", dpi = 300
+  )
+
+```
+
+Contig variation in abundance-based ranking as a function of mean coverage 
+depth:
+
+```{r plot_rank_variation}
+max_rank_range <- max(faecal_virome_contig_ranks %>% pull(rank_range))
+max_mean_abundance <- max(log10(faecal_virome_contig_ranks %>% pull(mean_depth)))
+min_mean_abundance <- min(log10(faecal_virome_contig_ranks %>% pull(mean_depth)))
+
+rank_range_rpkm_plots_refl <- list()
+for (M in c("WTA2", "SISPA")) {
+  for (S in c("S06", "S07", "S08")) {
+    p <- ggplot(
+      faecal_virome_contig_ranks %>%
+        filter(base_sample == S & rt_method == M),
+      aes(x = log10(mean_depth), y = rank_range)
+    ) +
+      geom_point(aes(color = length / 1000), size = 0.1, alpha = 0.5) +
+      nice_plot() +
+      scale_x_continuous(limits = c(
+        floor(min_mean_abundance / 0.1) * 0.1,
+        ceiling(max_mean_abundance / 0.1) * 0.1
+      )) +
+      scale_color_viridis_c(
+        trans = "log",
+        limits = c(0.2, NA),
+        breaks = c(1, 10, 100)
+      ) +
+      theme(
+        plot.background = element_blank(),
+        strip.background = element_blank(),
+        legend.box.background = element_rect(fill = "white", color = "white"),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom",
+        legend.key.height = unit(.3, "cm"),
+        legend.margin = margin(0, 0, 0, 0)
+      ) +
+      labs(
+        x = "mean depth (log10)",
+        y = "rank range",
+        color = "contig\nlength (kb)",
+        title = paste(S, M)
+      )
+    plegend <- get_legend(p)
+    pmarg <-
+      (p + theme(legend.position = "none")) %>% ggMarginal(type = "density", size = 7)
+    rank_range_rpkm_plots_refl[[length(rank_range_rpkm_plots_refl) + 1]] <-
+      pmarg
+  }
+}
+
+rank_range_rpkm_plot_refl <- ggarrange(
+  ggarrange(
+    plotlist = rank_range_rpkm_plots_refl,
+    ncol = 3,
+    nrow = 2
+  ),
+  plegend,
+  nrow = 2,
+  heights = c(10, 1)
+)
+
+rank_range_rpkm_plot_refl
+
+ggsave(
+  "figures/virome_variation/range_abundance_rank_vs_depth.png",
+  plot = rank_range_rpkm_plot_refl,
+  width = 16, height = 16, unit = "cm", dpi = 300
+)
+```
+
+Contig variation in relative abundance as a function of mean coverage depth:
+
+```{r plot_relab_variation}
+max_mean_depth <-
+  max(log10(faecal_virome_contig_ranks %>% pull(mean_depth)))
+min_mean_depth <-
+  min(log10(faecal_virome_contig_ranks %>% pull(mean_depth)))
+
+virome_relab_variation_plot <- ggplot(
+  faecal_virome_contig_ranks,
+  aes(x = log10(mean_depth),
+      y = relab_log2fd,
+      color = checkv_quality)
+  ) +
+  geom_point(size = 0.2, alpha = 0.5) +
+  nice_plot() +
+  facet_grid(base_sample ~ rt_method) +
+  scale_x_continuous(limits = c(
+      floor(min_mean_depth / 0.1) * 0.1,
+    ceiling(max_mean_depth / 0.1) * 0.1
+  )) +
+  scale_y_continuous(limits = c(
+      floor(min((faecal_virome_contig_ranks$relab_log2fd)) / 0.1) * 0.1,
+    ceiling(max((faecal_virome_contig_ranks$relab_log2fd)) / 0.1) * 0.1)
+  ) +
+  scale_color_manual(
+    values = checkv_quality_palette,
+    labels = c(
+      "Complete" = "CPLT",
+      "High-quality" = "HQ",
+      "Medium-quality" = "MQ",
+      "Low-quality" = "LQ",
+      "Not-determined" = "ND"
+    ),
+    guide = guide_legend(override.aes = c(size = 3))
+  ) +
+  theme(
+    plot.background = element_blank(),
+    strip.background = element_blank(),
+    legend.box.background = element_rect(fill = "white", color = "white"),
+    strip.text.y = element_text(face = "bold"),
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.direction = "horizontal",
+    legend.key.height = unit(.3, "cm"),
+    legend.margin = margin(0, 0, 0, 0),
+    strip.text = element_text(size = 9, face = "bold")
+  ) +
+  labs(x = "mean coverage (log10)",
+       y = "fold difference of relative abundance (log2)",
+       color = "estimated\ncompleteness")
+
+virome_relab_variation_plot
+
+ggsave(
+  "figures/virome_variation/relab_variation.png",
+  plot = virome_relab_variation_plot,
+  width = 11, height = 12, unit = "cm", dpi = 300
+)
+
+```
+
+Percentage of contigs with LCD vs. HCD:
+
+```{r stat_p_hcd_vs_lcd}
+
+faecal_virome_contig_ranks %>% 
+  group_by(rt_method, lcd_hcd) %>% 
+  summarise(
+    n = n()
+  ) %>% 
+  pivot_wider(names_from = lcd_hcd, values_from = n) %>% 
+  rowwise() %>% 
+  mutate(
+    p_HCD = HCD / (HCD + LCD),
+    p_LCD = LCD / (HCD + LCD)
+  )
+  
+```
+
+
+Variation in fold-difference of relative abundance:
+
+```{r stat_relab_variation_fd}
+faecal_virome_contig_ranks %>% 
+  group_by(rt_method, lcd_hcd) %>% 
+  summarise(
+    fd_min = min(relab_fd),
+    fd_max = max(relab_fd),
+    fd_median = median(relab_fd)
+  )
+```
+
+Variation in fold-difference of relative abundance. Removed outliers by 
+ignoring the 10% of contigs with the highest variation:
+
+```{r stat_relab_variation_fd_90p}
+
+faecal_virome_contig_ranks %>% 
+  mutate(lcd_hcd = if_else(mean_depth < 10, "LCD", "HCD")) %>% 
+  group_by(rt_method, lcd_hcd) %>% 
+  slice_min(relab_fd, prop = .9) %>% 
+  summarise(
+    fd_min = min(relab_fd),
+    fd_max = max(relab_fd),
+    fd_median = median(relab_fd)
+  )
+```
+
+High- versus low-coverage contigs qualified as complete, high-quality or
+medium-quality by CheckV:
+
+```{r stat_qual_vs_cd}
+faecal_virome_contig_ranks %>% 
+  filter(checkv_quality %in%  c("Complete", "High-quality", "Medium-quality")) %>% 
+  group_by(rt_method, lcd_hcd, checkv_quality) %>% 
+  summarise(
+    n = n()
+  ) %>% 
+  pivot_wider(names_from = lcd_hcd, values_from = n,values_fill = 0, names_prefix = "n_") %>% 
+  rowwise() %>% 
+  mutate(
+    p_HCD = n_HCD / (n_HCD + n_LCD),
+    p_LCD = n_LCD / (n_HCD + n_LCD)
+  ) %>% 
+  rbind(
+  faecal_virome_contig_ranks %>% 
+    filter(checkv_quality %in%  c("Complete", "High-quality", "Medium-quality")) %>% 
+    group_by(lcd_hcd, checkv_quality) %>% 
+    summarise(
+      n = n()
+    ) %>% 
+    mutate(rt_method = "Total") %>% 
+    pivot_wider(names_from = lcd_hcd, values_from = n,values_fill = 0, names_prefix = "n_") %>% 
+    rowwise() %>% 
+    mutate(
+      p_HCD = n_HCD / (n_HCD + n_LCD),
+      p_LCD = n_LCD / (n_HCD + n_LCD)
+    )
+  )
+```
+
+Fold difference of MQ, HQ, and Complete contigs:
+
+```{r stat_qual_vs_fd}
+
+faecal_virome_contig_ranks %>% 
+  filter(checkv_quality %in%  c("Complete", "High-quality", "Medium-quality")) %>% 
+  group_by(rt_method, lcd_hcd, checkv_quality) %>% 
+  summarise(
+    n = n(),
+    fd_min = min(relab_fd),
+    fd_max = max(relab_fd),
+    fd_median = median(relab_fd)
+  )
+
+```
+
+Number of contigs for each quality rank with low and high fold-difference in 
+relative abundance (and the number of contigs in each category with high 
+coverage depth):
+
+
+```{r stat_qual_vs_folddiff_relab}
+
+faecal_virome_contig_ranks %>% 
+  filter(checkv_quality %in%  c("Complete", "High-quality", "Medium-quality")) %>% 
+  mutate(lfd_hfd = if_else(relab_fd > 1.5, "HFD", "LFD")) %>% 
+  group_by(rt_method, lfd_hfd, checkv_quality) %>% 
+  summarise(
+    n = n(), n_hcd = sum(lcd_hcd == "HCD")
+  ) %>% 
+  rbind(
+  faecal_virome_contig_ranks %>% 
+    filter(checkv_quality %in%  c("Complete", "High-quality", "Medium-quality")) %>% 
+    mutate(lfd_hfd = if_else(relab_fd > 1.5, "HFD", "LFD")) %>% 
+    group_by(lfd_hfd, checkv_quality) %>% 
+    summarise(
+      n = n(), n_hcd = sum(lcd_hcd == "HCD")
+    ) %>% 
+    mutate(rt_method = "Total")
+  )  %>% 
+  pivot_wider(names_from = lfd_hfd, values_from = c("n", "n_hcd"), values_fill = 0) %>% 
+  rowwise() %>% 
+  mutate(
+    p_HFD = n_HFD / (n_HFD + n_LFD),
+    p_LFD = n_LFD / (n_HFD + n_LFD)
+  )
+```
+
+Number of high-coverage depth contigs for each quality rank with low and high 
+fold-difference in relative abundance:
+
+```{r stat_qual_vs_folddiff_relab_hcd}
+
+faecal_virome_contig_ranks %>% 
+  filter(
+    checkv_quality %in%  c("Complete", "High-quality", "Medium-quality") &
+      lcd_hcd == "HCD") %>% 
+  mutate(lfd_hfd = if_else(relab_fd > 1.5, "HFD", "LFD")) %>% 
+  group_by(rt_method, lfd_hfd, checkv_quality) %>% 
+  summarise(
+    n = n()
+  ) %>% 
+  rbind(
+  faecal_virome_contig_ranks %>% 
+    filter(
+      checkv_quality %in%  c("Complete", "High-quality", "Medium-quality") &
+        lcd_hcd == "HCD") %>% 
+    mutate(lfd_hfd = if_else(relab_fd > 1.5, "HFD", "LFD")) %>% 
+    group_by(lfd_hfd, checkv_quality) %>% 
+    summarise(
+      n = n()
+    ) %>% 
+    mutate(rt_method = "Total")
+  )  %>% 
+  pivot_wider(names_from = lfd_hfd, values_from = n, values_fill = 0, names_prefix = "n_") %>% 
+  rowwise() %>% 
+  mutate(
+    p_HFD = n_HFD / (n_HFD + n_LFD),
+    p_LFD = n_LFD / (n_HFD + n_LFD)
+  )
+```
+
+Minimum and maximum cumulative relative abundance of LCD contigs:
+
+```{r stats_lcd_minmax_cumrelab}
+
+faecal_virome_abundance %>%
+  filter(contig_class == contig_classifications[["endo"]]) %>%
+  left_join(virome_mean_coverage, by = c("assembly", "base_sample", "rt_method", "contig")) %>%
+  mutate(lcd_hcd = if_else(mean_depth < 10, "LCD", "HCD")) %>% 
+  group_by(assembly, base_sample, spike, rt_method, lcd_hcd) %>% 
+  summarise(
+    tot_relab = sum(relab_vir)
+  ) %>% 
+  filter(lcd_hcd == "LCD") %>% 
+  ungroup() %>% 
+  summarise(
+    min_frac_reads = min(tot_relab),
+    max_frac_reads = max(tot_relab)
+  )
+```
+
+
+Fraction of contigs >=0.1% relative abundance with >=100X mean coverage:
+
+```{r stats_relab_vs_meancov}
+virome_abundance_classification %>%
+  filter(contig_class == contig_classifications[["endo"]]) %>% 
+  select(assembly, contig, length, base_sample, spike, rt_method, mapped_reads) %>% 
+  group_by(base_sample, spike, rt_method) %>% 
+  mutate(
+    total_viral_reads = sum(mapped_reads),
+    rpkm = mapped_reads / (length / 10^3) / (total_viral_reads  / 10^6),
+    total_rpkm = sum(rpkm),
+    relab = rpkm / total_rpkm
+  ) %>% 
+  group_by(assembly, contig, base_sample, rt_method) %>% 
+  summarise(
+    rpkm_mean = sum(mapped_reads) / sum(total_viral_reads),
+    relab_mean = 100 * sum(rpkm) / sum(total_rpkm)
+  ) %>% 
+  left_join(virome_mean_coverage, by = c("assembly", "contig", "base_sample", "rt_method")) %>% 
+  mutate(relab_hi = if_else(relab_mean >= 0.1, "hrelab", "lrelab")) %>% 
+  group_by(base_sample, rt_method, relab_hi) %>%
+  summarise(
+    n_10X = sum(mean_depth >= 10),
+    n_100X = sum(mean_depth >= 100),
+    n = n()
+  ) %>% 
+  mutate(
+    p_10X = 100 * n_10X / n,
+    p_100X = 100 * n_100X / n
+  ) %>% 
+  pivot_wider(names_from = relab_hi, values_from = c(n, n_10X, p_10X, n_100X, p_100X))
+```
+
+Maximum rank range by relative abundance:
+
+```{r stats_range_ranking_vs_relab}
+faecal_virome_contig_ranks %>%
+  mutate(relab_cat = case_when(
+    relab_mean < 0.01 ~ "<0.01%",
+    (relab_mean >= 0.01) & (relab_mean < 0.1) ~ ">0.01%",
+    (relab_mean >= 0.1) & (relab_mean < 1) ~ ">0.1%",
+    (relab_mean >= 1) & (relab_mean < 10) ~ ">1%",
+    relab_mean >= 10 ~ ">=10%"
+  )) %>%
+  group_by(base_sample, rt_method, relab_cat) %>% 
+  summarise(
+    max_range = max(rank_range)
+  ) %>% 
+  pivot_wider(names_from = relab_cat, values_from = max_range)
+
+
+```
+
+
+
+### Variation based on mean relative abundance
+
+Variation in relative abundance depending on mean relative abundance:
+
+```{r plot_relative_abundance_variation_by_relative_abundance, message=FALSE}
+relative_abundance_bins <- faecal_virome_contig_ranks %>%
+  group_by(assembly, base_sample, rt_method) %>%
+  mutate(relab_cat = case_when(
+    relab_mean < 0.1 ~ "<0.1%",
+    (relab_mean >= 0.1) & (relab_mean < 1) ~ "<1%",
+    (relab_mean >= 1) & (relab_mean < 10) ~ "<10%",
+    relab_mean >= 10 ~ ">=10%"
+  )) %>%
+  group_by(base_sample, rt_method, relab_cat)
+
+ggplot(
+  relative_abundance_bins %>%
+    summarise(
+      n = n(),
+      mean = mean(relab_fd),
+      median = median(relab_fd),
+      sd = sd(relab_fd),
+      se = sd / sqrt(n())
+    ),
+  aes(
+    x = relab_cat,
+    y = mean,
+    ymin = mean - se,
+    ymax = mean + se
+  )
+) +
+  geom_errorbar(orientation = "vertical") +
+  geom_point() +
+  nice_plot() +
+  facet_grid(base_sample ~ rt_method) +
+  scale_y_continuous(limits = c(1, NA), expand = nice_scale_expansion)+
+  rotate_x_text(angle = 45) +
+  theme(strip.text = element_text(size = 9, face = "bold")) +
+  labs(x = "relative abundance", y = "mean fold difference of relative abundance")
+
+ggsave(
+  "figures/virome_variation/relative-abundance-variation_by_relab-bin.png",
+  width = 5, height = 10, units= "cm", dpi = 300
+)
+```
+
+### Variability between two measurements
+
+From contigs with reads in all three replicates,the RPKM values
+from two of those replicates are randomly selected.
+
+```{r sample_two_measurements}
+set.seed(1985)
+
+faecal_virome_two_samples <- faecal_virome_abundance %>% 
+  group_by(base_sample, rt_method, contig) %>%
+  mutate(present_in_all = prod(rpkm) != 0) %>% 
+  filter(present_in_all) %>%
+  slice_sample(n=2) %>%
+  left_join(
+    virome_mean_coverage,
+    by = c("assembly", "base_sample", "rt_method", "contig")
+    ) %>%
+  mutate(
+    mean_depth_bin = factor(
+      case_when(
+        mean_depth < 10 ~ "<10" ,
+        mean_depth >= 10 & mean_depth <100 ~ "10-100",
+        mean_depth >= 100 ~ ">=100",
+      ),
+      levels = c("<10", "10-100", ">=100")
+    ),
+    mean_depth_group = factor(
+      case_when(
+        mean_depth < 10 ~ "LCD" ,
+        mean_depth >= 10 ~ "HCD"
+      ))
+  ) 
+
+set.seed(NULL)
+
+gen_cutoff_perc_fun <- function(max_perc_diff){
+    return(
+      eval(
+        parse(text=paste0("function(x) sum(x <= ", max_perc_diff, ") / n()"))
+        )
+      )
+}
+
+cutoff_percentages <- seq(from = 10, to = 150, by = 10)
+cutoff_perc_functions <- lapply(cutoff_percentages, gen_cutoff_perc_fun)
+names(cutoff_perc_functions) <- paste0("n_", cutoff_percentages)
+
+format_gt_table <- function(x){
+  return(
+    x %>% 
+      gt() %>% 
+      tab_footnote(
+        footnote = "HCD: High coverage depth (>=10X), LCD: Low coverage depth (<10X).",
+        locations = cells_column_labels(columns = starts_with("mean_depth_"))
+      ) %>% 
+      fmt_percent(starts_with("n_"), decimals = 1) %>% 
+      tab_spanner("Maximum % difference", starts_with("n_")) %>% 
+      cols_label(starts_with("mean_depth_") ~ "Depth bin") %>% 
+      cols_label_with(starts_with("n_"), function(x) paste0(str_remove(x, "n_"), "%"))
+      )
+}
+```
+
+Then, the difference between the two values is calculated as a percentage of 
+the first value, the highest of the two values, or the lowest of the two values.
+
+Percentage of contigs with less than `x`% difference between the first and 
+second of two randomly selected measurements from the three replicates:
+
+```{r stats_perc_contigs_with_x_perc_diff}
+faecal_virome_two_samples %>%
+  mutate(sample_pair = if_else(row_number() == 1, "A", "B")) %>%
+  pivot_wider(
+    id_cols = c(
+      assembly,
+      contig,
+      base_sample,
+      rt_method,
+      mean_depth_bin,
+      mean_depth_group
+    ),
+    names_from = sample_pair,
+    values_from = "rpkm_vir"
+  ) %>% 
+  mutate(
+    diff_rpkm = 100 * abs(A - B) / A
+  ) %>% 
+  group_by(rt_method, mean_depth_group) %>% 
+  summarise_at("diff_rpkm", cutoff_perc_functions) %>% 
+  format_gt_table()
+
+```
+
+Percentage of contigs with less than `x`% difference between the two randomly 
+selected measurements, as a percentage of the highest value (giving the lowest % 
+difference for the two measurements):
+
+```{r stats_perc_contigs_with_x_perc_diff_min}
+# Difference between high and low as perc. of high
+faecal_virome_two_samples %>%
+  summarise(
+    mean_depth_bin = first(mean_depth_bin),
+    mean_depth_group = first(mean_depth_group),
+    diff_rpkm_min = 100 * (max(rpkm_vir) - min(rpkm_vir)) / max(rpkm_vir)
+  ) %>% 
+  group_by(rt_method, mean_depth_group) %>% 
+  summarise_at("diff_rpkm_min", cutoff_perc_functions) %>% 
+  format_gt_table()
+```
+
+Percentage of contigs with less than `x`% difference between the two randomly 
+selected measurements, as a percentage of the lowest value (giving the highest % 
+difference for the two measurements):
+
+```{r stats_perc_contigs_with_x_perc_diff_max}
+# Difference between high and low as perc. of low
+faecal_virome_two_samples %>%
+  summarise(
+    mean_depth_bin = first(mean_depth_bin),
+    mean_depth_group = first(mean_depth_group),
+    diff_rpkm_max = 100 * (max(rpkm_vir) - min(rpkm_vir)) / min(rpkm_vir)
+  ) %>% 
+  group_by(rt_method, mean_depth_group) %>% 
+  summarise_at("diff_rpkm_max", cutoff_perc_functions) %>% 
+  format_gt_table()
+```
+
+Average median fold difference of relative abundance by coverage depth bin:
+
+```{r stats_relab_fd_cd_bins}
+faecal_virome_contig_ranks %>% 
+  mutate(
+    mean_depth_bin = factor(
+      case_when(
+        mean_depth < 10 ~ "<10" ,
+        mean_depth >= 10 & mean_depth <100 ~ "10-100",
+        mean_depth >= 100 ~ ">=100",
+      ),
+      levels = c("<10", "10-100", ">=100")
+    )
+  ) %>% 
+  group_by(base_sample, rt_method, mean_depth_bin) %>% 
+  summarise(
+    median_fd = median(rpkm_fd)
+  ) %>% 
+  pivot_wider(names_from = rt_method, values_from = median_fd)
+
+faecal_virome_contig_ranks %>% 
+  mutate(
+    mean_depth_bin = factor(
+      case_when(
+        mean_depth < 10 ~ "<10" ,
+        mean_depth >= 10 & mean_depth <100 ~ "10-100",
+        mean_depth >= 100 ~ ">=100",
+      ),
+      levels = c("<10", "10-100", ">=100")
+    )
+  ) %>% 
+  group_by(rt_method, mean_depth_bin) %>% 
+  summarise(
+    mean_fd_log10 = mean(rpkm_log10fd),
+    sd_fd_log10 = sd(rpkm_log10fd)
+  ) %>% 
+  mutate(
+    mean_fd = 10^mean_fd_log10,
+    mean_fd_minsd = 10^(mean_fd_log10 - sd_fd_log10),
+    mean_fd_plussd = 10^(mean_fd_log10 + sd_fd_log10)
+  )
+```
+
+```{r stats_relab_range_by_relab_bin}
+relative_abundance_bins %>%
+  filter(relab_mean >= 0.1) %>% 
+  group_by(rt_method) %>% 
+  summarise(
+    mean_fd_relab = mean(relab_fd),
+    median_fd_relab = median(relab_fd)
+  )
+  
+
+```
+
+Variation in abundance-based ranking depending on mean relative abundance:
+
+```{r plot_abundance_rank_by_relative_abundance, message=FALSE}
+ggplot(
+  relative_abundance_bins %>%
+    summarise(
+      n = n(),
+      mean = mean(rank_range_norm),
+      median = median(rank_range_norm),
+      sd = sd(rank_range_norm),
+      se = sd / sqrt(n())
+    ),
+  aes(
+    x = relab_cat,
+    y = 100 * mean,
+    ymin = 100 * (mean - se),
+    ymax = 100 * (mean + se)
+  )
+) +
+  nice_plot() +
+  geom_errorbar(orientation = "vertical") +
+  geom_point() +
+  nice_plot() +
+  facet_grid(base_sample ~ rt_method) +
+  ylim(0, NA) +
+  rotate_x_text(angle = 45) +
+  theme(strip.text = element_text(size = 9, face = "bold")) +
+  labs(x = "relative abundance", y = "mean rank range\n(% of total contigs)")
+
+ggsave(
+  "figures/virome_variation/abundance-rank-variation_by_relab-bin.png",
+  width = 5, height = 10, units= "cm", dpi = 300
+)
+```
+
+### Variation of top 10 faecal viruses
+
+```{r calc_top10_stats}
+faecal_virome_top10 <- faecal_virome_abundance %>% 
+  # Calculate mean relative abuncance
+  group_by(assembly, contig, base_sample, rt_method) %>% 
+  mutate(relab_vir_mean = 100 * sum(rpkm_vir) / sum(tot_rpkm_vir)) %>% 
+  # Collect the top 10 of each sample
+  group_by(assembly, base_sample, spike, rt_method) %>% 
+  slice_max(order_by = relab_vir, n = 10) %>% 
+  select(base_sample, spike, rt_method, contig, relab_vir, relab_vir_mean) %>% 
+  arrange(assembly, base_sample, rt_method, desc(relab_vir_mean), spike) %>% 
+  pivot_wider(names_from = spike, values_from = relab_vir)
+
+faecal_virome_top10_differences <- faecal_virome_abundance %>% 
+  # Calculate mean relative abuncance
+  group_by(assembly, contig, base_sample, rt_method) %>% 
+  mutate(
+    rpkm_vir_combined = sum(mapped_reads) / (length / 10^3) / (sum(tot_reads_vir) / 10^6),
+    ) %>% 
+  group_by(assembly, base_sample, rt_method) %>% 
+  mutate(relab_vir_combined = rpkm_vir_combined / (sum(rpkm_vir_combined) / 3)) %>% 
+  group_by(assembly, base_sample, spike, rt_method) %>% 
+  slice_max(order_by = relab_vir_combined, n = 10) %>% 
+  mutate(contig_nr = factor(row_number()))%>% 
+  group_by(assembly, contig, base_sample, rt_method) %>% 
+  summarise(
+    contig_nr = first(contig_nr),
+    rpkm_vir_combined = first(rpkm_vir_combined),
+    rpkm_vir_max = max(rpkm_vir),
+    rpkm_vir_min = min(rpkm_vir),
+    relab_vir_combined = first(relab_vir_combined),
+    relab_vir_max = max(relab_vir),
+    relab_vir_min = min(relab_vir)
+  ) %>% 
+  mutate(
+    fd_rpkm = (rpkm_vir_max - rpkm_vir_min) / rpkm_vir_min,
+    fd_rpkm2 = rpkm_vir_max / rpkm_vir_min,
+    diff_relab = relab_vir_max - relab_vir_min
+  ) %>% 
+  arrange(assembly, desc(rpkm_vir_combined)) 
+```
+
+```{r plot_top10_composition}
+contig_colors <- c(pal_cat, pal_cat_dark, pal_cat_light)
+names(contig_colors) <- paste0("contig_", sprintf("%02d", c(1:18)))
+
+ggplot(
+  rbind(
+    faecal_virome_top10 %>% 
+      group_by(assembly, base_sample, rt_method) %>% 
+      mutate(contig_nr = paste0("contig_", sprintf("%02d", row_number()))) %>% 
+      pivot_longer(cols = c(NO, LO, HI), names_to = "spike", values_to = "relab_vir" ),
+    faecal_virome_abundance %>% 
+      # Calculate mean relative abuncance
+      group_by(assembly, contig, base_sample, rt_method) %>% 
+      mutate(relab_vir_mean = 100 * sum(rpkm_vir) / sum(tot_rpkm_vir)) %>% 
+      # Collect the top 10 of each sample
+      group_by(assembly, base_sample, spike, rt_method) %>% 
+      slice_max(order_by = relab_vir, n = 10) %>% 
+      select(base_sample, spike, rt_method, contig, relab_vir, relab_vir_mean) %>% 
+      arrange(assembly, base_sample, rt_method, desc(relab_vir_mean), spike) %>% 
+      summarise(relab_vir = 100 - sum(relab_vir)) %>% 
+      mutate(contig_nr = "Remaining")
+  ),
+  aes(x = spike, y = relab_vir, fill = contig_nr)
+) + 
+  geom_bar(stat = "identity", position = "stack") +
+  nice_plot()+
+  facet_grid(rt_method ~ base_sample) + 
+  scale_fill_manual(values = c(contig_colors, "Remaining" = "black")) +
+  scale_y_continuous(expand = c(0,0))
+
+```
+
+```{r plot_top10_variation}
+ggplot(
+  faecal_virome_top10_differences,
+  aes(x = contig_nr, y = 100 * fd_rpkm, color = rt_method)
+) + 
+  geom_point() +
+  nice_plot() + 
+  scale_color_manual(values = method_palette)
+
+ggplot(
+  faecal_virome_top10_differences,
+  aes(x = contig_nr, y = diff_relab, color = rt_method)
+) + 
+  geom_point() +
+  nice_plot() + 
+  scale_color_manual(values = method_palette)
+
+ggplot(
+  faecal_virome_top10_differences,
+  aes(x = relab_vir_combined, y = 100 * fd_rpkm, color = rt_method)
+) + 
+  geom_point() +
+  nice_plot() + 
+  scale_color_manual(values = method_palette)
+```
+
+```{r stats_top10_variation}
+faecal_virome_top10_differences %>% 
+  pivot_wider(
+    id_cols = contig_nr,
+    names_from = c(base_sample, rt_method), 
+    values_from = fd_rpkm
+  ) %>% 
+  gt() %>% 
+  fmt_percent(ends_with(c("SISPA", "WTA2"))) %>% 
+  tab_spanner_delim("_", columns = ends_with(c("SISPA", "WTA2")))
+```
+
+```{r stats_top4_diff_minmax}
+faecal_virome_top10_differences %>% 
+  filter(contig_nr %in% c(1:4)) %>% 
+  ungroup() %>% 
+  summarise(
+    min = min(fd_rpkm),
+    max = max(fd_rpkm)
+  )
+  
+```
+
+
+### Stats of unclassified sequences
+
+```{r stats_unclass}
+
+unclass_contigs <- virome_classifications %>% 
+  left_join(
+    coassembly_contig_stats,
+    by = join_by(assembly == assembly_name, contig)
+  ) %>% 
+  filter(!is_viral & !is_mock) %>% 
+  separate(assembly, remove=FALSE, into = c("base_sample", "rt_method"))
+
+
+unclass_contigs %>% 
+  group_by(base_sample, rt_method) %>% 
+  summarise(
+    mean_gc = mean(gc),
+    p_high_gc = 100 * sum(gc > 50) / n()
+  )
+```
+
+```{r stats_mean_depth_by_class}
+virome_mean_coverage %>% 
+  left_join(
+    virome_classifications,
+    by = c("assembly", "contig")
+  ) %>% 
+  group_by(rt_method, contig_class) %>% 
+  summarise(
+    n = n(),
+    depth_mean = mean(mean_depth),
+    depth_median = median(mean_depth)
+  )
+
+
+ggplot(
+  virome_mean_coverage %>% 
+    left_join(
+      virome_classifications,
+      by = c("assembly", "contig")
+    ),
+  aes(x = rt_method, y = mean_depth, color = contig_class)
+) + 
+  geom_violin() +
+  scale_y_log10()
+```
+
+
+```{r stats_mean_relab_by_class}
+virome_abundance_classification %>% 
+  group_by(rt_method, contig_class) %>% 
+  summarise(
+    mean_relab = mean(relab),
+    median_relab = median(relab)
+  )
+
+```
+
+
+
+```{r stats_frac_reads_by_class}
+virome_abundance_classification %>% 
+  filter(spike == "HI") %>%
+  group_by(base_sample, spike, rt_method, contig_class) %>% 
+  summarise(
+    tot_reads_mapped = sum(mapped_reads),
+    tot_reads = first(tot_reads)
+  ) %>% 
+  group_by(rt_method, contig_class) %>% 
+  summarise(
+    tot_reads_mapped = sum(tot_reads_mapped),
+    tot_reads = sum(tot_reads)
+  ) %>% 
+  mutate(
+    frac_reads = tot_reads_mapped / tot_reads
+  ) 
+
+```

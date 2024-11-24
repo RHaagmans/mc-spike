@@ -1,0 +1,24 @@
+name: mc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - seqkit
+  - ca-certificates
+  - openssl
+  - fastp
+  - htstream
+  - fastqc
+  - multiqc
+  - bowtie2
+  - certifi
+  - samtools
+  - megahit
+  - cd-hit
+  - blast
+  - checkv
+  - genomad
+  - quast
+  - pandas
+  - openpyxl
+prefix: /home/ubuntu/miniforge3/envs/mc

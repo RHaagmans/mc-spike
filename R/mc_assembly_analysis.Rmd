@@ -1,0 +1,1087 @@
+---
+title: "Mock community assembly"
+author: "Rik Haagmans"
+date: "2024-08-22"
+output: html_document
+params:
+  output_dir: "../"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(params$output_dir))
+library(tidyverse)
+library(ggh4x)
+library(gt)
+source("helper_functions.R")
+source("data_files.R")
+
+mc_blast_min_cov <- 95
+mc_blast_min_ani <- 98
+```
+
+The purpose of this report is to show the difference between estimated abundance 
+of virus genomes based on assembled contigs and based on the complete refernce
+genome.
+
+
+First, the read mapping statistics (calculated by `samtools idxstats`) 
+for the Mock Community (MC) virus reference genomes is loaded. Then, the read 
+mapping statistics for the assemblies is loaded. Lastly, we load the results of 
+the BLAST alignment of the assembly against the reference genomes, to identify 
+contigs originating from the MC 
+viruses. 
+
+Abundance is calculated based on RPKM (**R**eads **P**er **K**ilobase of
+reference (either reference genome or contig) per total number of reads in the 
+sample in **M**illions).
+
+Additionaly, the read depth statistics are loaded (calculated by `samtools 
+depth`), to extract the coverage depth profiles of MC viruses.
+
+```{r load_data, message=FALSE, warning=FALSE}
+# Load reference genome ID to virus table
+mc_ref_to_virus <- read_csv(mc_ref_to_virus_file)
+
+# Load assembly read mapping statistics (samtools idxstats)
+assembly_readmap_stats <-
+  load_idxstats(assembly_idxstats_file) %>%
+  mutate(
+    fraction_reads = mapped_reads / tot_reads,
+    rpm = mapped_reads / (tot_reads / 10 ^ 6),
+    rpkm = (mapped_reads / (length / 10 ^ 3)) / (tot_reads / 10 ^ 6)
+  )
+
+# Identify MC virus contigs
+mc_contigs <- load_blast_ani_results(assembly_mcblast_results_file) %>%
+  filter(qcov >= mc_blast_min_cov & ani >= mc_blast_min_ani) %>%
+  left_join(mc_ref_to_virus,
+            by = "ref")
+
+
+# Load MC reference genome read mapping statistics
+mc_readmap_stats_full <- load_idxstats(
+    mc_readmap_idxstats_file, 
+    set_assembly = "mc-genomes"
+  ) %>%
+  mutate(
+    fraction_reads = mapped_reads / tot_reads,
+    rpm = mapped_reads / (tot_reads / 10 ^ 6),
+    rpkm = (mapped_reads / (length / 10 ^ 3)) / (tot_reads / 10 ^ 6)
+  ) %>%
+  left_join(mc_ref_to_virus,
+            by = "ref")
+
+# Load read coverage depth statistics (samtools depth)
+mc_read_depth <- load_depth_table(mc_readmap_depth_file)
+
+# Calculate % coverage of the reference genome where depth >= 1
+mc_read_coverage <- calculate_coverage(mc_read_depth)
+
+# Table of abundance (RPKMs) of MC contigs in the assembly, and reference 
+# genome lengths
+mc_rpkms <- left_join(
+  mc_contigs,
+  assembly_readmap_stats %>%
+    select(
+      assembly,
+      sample,
+      base_sample,
+      spike,
+      rt_method,
+      ref,
+      length,
+      rpkm,
+      tot_reads,
+      mapped_reads
+    ) %>%
+    rename(contig = ref),
+  by = c('assembly', 'contig')
+) %>%
+  left_join(
+    mc_readmap_stats_full %>% 
+      group_by(ref) %>% 
+      summarise(ref_length = first(length)),
+    by = "ref"
+    )
+
+# Table of reference genomes and the number and total length of contigs
+# matching the reference genomes
+mc_ref_cov <- mc_rpkms %>%
+  mutate(ref = factor(ref)) %>%
+  droplevels() %>%
+  group_by(assembly, sample, base_sample, spike, rt_method, ref) %>%
+  summarise(
+    ref_length = first(ref_length),
+    n_contigs = n(),
+    tot_cov = sum(length)
+  ) %>%
+  left_join(mc_ref_to_virus,
+            by = "ref") %>%
+  group_by(assembly, sample, base_sample, spike, rt_method, virus) %>%
+  summarise(
+    ref_length = sum(ref_length),
+    n_contigs = sum(n_contigs),
+    tot_cov = sum(tot_cov)
+  ) %>%
+  mutate(perc_cov = tot_cov / ref_length)
+
+# Table of total combined RPKMs for contigs matching a reference genome in each
+# sample.
+mc_assembly_rpkm <- mc_rpkms %>% 
+  filter(spike != "NO" & base_sample != "SMC") %>% 
+  select(assembly, contig, length, sample, mapped_reads, tot_reads, ref, virus) %>% 
+  group_by(assembly, sample, virus) %>% 
+  summarise(
+    tot_mapped_reads = sum(mapped_reads),
+    tot_reads = first(tot_reads),
+    tot_length = sum(length)
+  ) %>% 
+  mutate(
+    rpkm_assembly = tot_mapped_reads / (tot_length / 10^3) / (tot_reads / 10^6)
+  )
+
+# Table or RPKMs for the reference genomes. Summarised at the virus level, i.e.
+# summing reads and contig lengths for virus genome segments, e.g., Rotavirus.
+mc_readmap_stats <- mc_readmap_stats_full %>%
+  sum_segment_readcounts() %>%
+  mutate(rpkm = mapped_reads / (ref_length / 10 ^ 3) / (tot_reads / 10 ^
+                                                          6)) %>%
+  select(sample, base_sample, spike, rt_method, virus, ref_length, rpkm, mapped_reads) %>%
+  filter(spike != "NO" & base_sample != "SMC" & virus != "BVDV")
+
+mc_read_contig_cov <- left_join(
+  mc_read_coverage %>%
+    left_join(mc_ref_to_virus,
+              by = "ref") %>%
+    select(-sample) %>%
+    group_by(base_sample, spike, rt_method, virus) %>%
+    summarise(total_bp = sum(total_bp), covered = sum(covered)) %>%
+    mutate(coverage_reads = covered / total_bp) %>%
+    select(base_sample, spike, rt_method, virus, coverage_reads),
+  mc_ref_cov %>% rename(coverage_contigs = perc_cov),
+  by = join_by(base_sample, spike, rt_method, virus)
+) %>%
+  pivot_longer(
+    cols = starts_with("coverage_"),
+    names_to = "measure",
+    names_prefix = "coverage_",
+    values_to = "coverage"
+  ) %>%
+  filter(virus != "BVDV") %>%
+  droplevels()
+
+ref_vs_ass_abundance <- left_join(
+  mc_rpkms %>%
+    filter(base_sample %in% base_sample_faecal &
+             spike != "NO") %>% droplevels() %>%
+    select(base_sample, spike, rt_method, virus, contig, rpkm, length) %>%
+    group_by(base_sample, spike, rt_method, virus) %>%
+    mutate(rpm = rpkm * (length / 1000)) %>%
+    summarise(
+      ctg_abundance_min = min(rpkm),
+      ctg_abundance_max = max(rpkm),
+      ass_abundance_median = median(rpkm),
+      ass_abundance_mean = sum(rpm) / (sum(length / 1000))
+    ),
+  mc_read_contig_cov %>%
+    filter(
+      base_sample %in% base_sample_faecal &
+        spike != "NO" & measure == "contigs"
+    ) %>% droplevels() %>%
+    select(-ref_length, -measure, -tot_cov) %>% rename(ref_cov_contig = coverage),
+  by = c("base_sample", "spike", "rt_method", "virus")
+) %>%
+  left_join(
+    mc_readmap_stats %>%
+      select(-sample, -ref_length) %>% rename(ref_abundance = rpkm),
+    by = c("base_sample", "spike", "rt_method", "virus")
+  ) %>%
+  mutate(
+    fd_abundance_median = ass_abundance_median / ref_abundance,
+    fd_abundance_mean = ass_abundance_mean / ref_abundance
+  )
+
+mc_ref_rpkm <- mc_readmap_stats %>% 
+    select(sample, virus, ref_length, rpkm) %>% 
+    rename(rpkm_ref = rpkm)
+
+# Combine reference and assembly RPKMs
+rpkm_ref_vs_ass <- left_join(
+  mc_assembly_rpkm,
+  mc_ref_rpkm,
+  by = join_by(sample, virus)
+) %>% 
+  left_join(
+    mc_ref_cov %>% 
+      ungroup() %>% 
+      select(assembly, virus, n_contigs, tot_cov, perc_cov),
+    by = join_by(assembly, virus)
+  )
+```
+
+The difference in relative abundance based on reads mapped to the assembly 
+and reads mapped to the reference genomes:
+
+```{r plot_hi_lo_abundance, message=FALSE}
+mc_assembly_rpkm_hi_lo_plot_manuscript <- ggplot(
+  mc_rpkms %>%
+    filter(base_sample %in% base_sample_faecal & spike != "NO") %>%
+    mutate(spike = factor(spike, levels = rev(spike_order))) %>%
+    droplevels(),
+  aes(x = base_sample, y = log10(rpkm), color = base_sample)
+) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.3) +
+  geom_point(
+    position = position_jitterdodge(jitter.width = 1),
+    size = 0.7,
+    shape = 16,
+    alpha = 0.5
+  ) +
+  geom_point(
+    data = mc_readmap_stats %>%
+      filter(base_sample %in% base_sample_faecal &
+               spike != "NO") %>%
+      droplevels(),
+    aes(y = log10(rpkm)),
+    color = "black",
+    shape = 5,
+    size = 2
+  ) +
+  geom_text(
+    data = mc_ref_cov %>%
+      filter(base_sample %in% base_sample_faecal &
+               spike != "NO") %>%
+      droplevels(),
+    aes(label = paste0("(", n_contigs, ")")),
+    y = -3,
+    color = "black",
+    size = 7 / .pt,
+    fontface = "bold"
+  ) +
+  facet_nested(spike + rt_method ~ virus) +
+  nice_plot() +
+  theme(
+    legend.position = "bottom",
+    legend.margin = margin(0, 0, 0, 0),
+    strip.text = element_text(size = 9, face = "bold"),
+    panel.spacing.x = unit(0.1, "line"),
+    ggh4x.facet.nestline = element_line(colour = "black")
+  ) +
+  labs(x = "",
+       y = "abundance [log10(RPKM)]",
+       color = "") +
+  colorscheme_base_sample_color
+
+mc_assembly_rpkm_hi_lo_plot_manuscript
+
+ggsave(
+  "figures/mc_assembly/mc_assembly_abundance.png",
+  plot = mc_assembly_rpkm_hi_lo_plot_manuscript,
+  width = 16, height = 12, unit = "cm", dpi = 300
+  )
+```
+
+Comparing the relationship between coverage in the assembly and the ration between 
+the estimated abundance based on reads mapped against the assembly and the reference
+genome:
+
+```{r plot_cov_vs_abundance, message=FALSE}
+mean_cov_vs_abundance <- ggplot(
+  rpkm_ref_vs_ass, 
+  aes(x = perc_cov, y = rpkm_assembly / rpkm_ref)
+) +
+  geom_hline(yintercept = 1.25) +
+  geom_point(aes(color = virus, shape = spike), size = 2) +
+  nice_plot() +
+  colorscheme_virus_color +
+  scale_shape_manual(values = spike_shapes) +
+  labs(
+    x = "ref. coverage",
+    y = "RPKM (assembly) / RPKM (ref. genome)",
+    color = "MC virus",
+    shape = "MC spike"
+  )
+
+
+mean_cov_vs_abundance
+
+ggsave(
+  "figures/mc_assembly/mc_cov_vs_diff-abundance.png",
+  plot = mean_cov_vs_abundance,
+  width=10, height=10, unit="cm", dpi=300
+  )  
+
+mean_ratio_hicov <- rpkm_ref_vs_ass %>% 
+  filter(perc_cov >= .8) %>% 
+  mutate(ratio = rpkm_assembly / rpkm_ref) %>% 
+  ungroup() %>% 
+  summarise(mean_ratio = mean(ratio)) %>% 
+  pull(mean_ratio)
+```
+
+Fold difference between assembly and reference genome-based RPKM, for assemblies
+with >=80% coverage. The mean ratio for assemblies with >=80% coverage is 
+**`r round(mean_ratio_hicov, digits = 2)`**.
+
+```{r stats_fd_abundance_hicov}
+rpkm_ref_vs_ass %>% 
+  ungroup() %>% 
+  filter(perc_cov >= .8) %>% 
+  mutate(ratio = rpkm_assembly / rpkm_ref) %>% 
+  select(sample, virus, tot_length, n_contigs, ref_length, perc_cov, ratio) %>% 
+  arrange(desc(ratio)) %>% 
+  gt() %>% 
+  fmt_percent(perc_cov) %>% 
+  fmt_number(ratio) %>% 
+  fmt_number(ends_with("_length"), decimals = 0) %>% 
+  cols_label(
+    sample = "Sample",
+    virus = "Virus",
+    tot_length = "Assembly length, bp",
+    n_contigs = "Contigs, #",
+    ref_length = "Genome length, bp",
+    perc_cov = "Coverage, %",
+    ratio = "Abundance ratio, {{RPKM_ass / RPKM_ref}}"
+  )
+```
+
+Comparing the relationship between sequencing depth and total coverage in the 
+assembly for methods `r serial_comma(method_order)`:
+
+```{r plot_depth_vs_cov}
+
+mc_depth_cov_ratio <- left_join(
+  rpkm_ref_vs_ass,
+  mc_read_depth %>%
+    left_join(mc_ref_to_virus, by = "ref") %>%
+    group_by(base_sample, spike, rt_method, virus) %>% 
+    summarise(length = n(), tot_bp = sum(depth), .groups="keep") %>% 
+    mutate(read_depth = tot_bp / length),
+  by = join_by(base_sample, spike, rt_method, virus)
+)
+
+depth_vs_cov <- ggplot(
+  mc_depth_cov_ratio,
+  aes(x = log10(read_depth), y = perc_cov, color = rt_method)
+) + 
+  geom_point() +
+  nice_plot() +
+  scale_color_manual(values = method_palette) +
+  labs(
+    x = "depth log10(bp/kbp)",
+    y = "ref. coverage",
+    color = ""
+  ) +
+  theme(legend.position = "bottom")
+
+depth_vs_cov
+
+ggsave(
+  "figures/mc_assembly/mc_dep_vs_cov.png",
+  plot = depth_vs_cov,
+  width=6, height=10, unit="cm", dpi=300
+  )  
+```
+
+# Simulating depth profiles and fold-difference of abundance
+
+To further understand the effect of coverage depth profile uniformity on 
+assembly coverage and the fold-difference between assembly-based and reference-
+based abundance calculation, the coverage depth profiles are simulated.
+
+First, the sequencing depth profile of a 100,000 bp genome is simulated. They 
+are based on gaussian functions with varying heights and widths. 
+
+```{r sim_depth_profile, echo=TRUE}
+sim_genome_length <- 10 ^ 5
+sim_read_length <- 150
+
+# Simulate a depth profile using stacked gaussian functions
+gaussian_function <- function(x,
+                              a = 1,
+                              b = 1,
+                              c = 1) {
+  return(a * exp(-((x - b) ^ 2 / (2 * c ^ 2))))
+}
+
+mu = 500
+sigma = 20
+norm_a = 1 / (sqrt(2 * pi * sigma ^ 2))
+norm_c = sigma
+
+x = c(1:sim_genome_length + sim_read_length)
+
+y = gaussian_function(
+  x, a = norm_a, b = 0.1 * sim_genome_length, c = 2000
+  )  +
+  gaussian_function(
+    x, a = 0.5 * norm_a, b = 0.3 * sim_genome_length, c = 3000
+    ) +
+  gaussian_function(
+    x, a = 0.1 * norm_a, b = 0.6 * sim_genome_length, c = 3000
+    ) +
+  gaussian_function(
+    x, a = 0.8 * norm_a, b = 0.8 * sim_genome_length, c = 2000
+    ) +
+  gaussian_function(
+    x, a = 0.2 * norm_a, b = 0.5 * sim_genome_length, c = sim_genome_length
+    )
+
+y_extreme =  gaussian_function(
+  x, a = 2 * norm_a, b = 0.1 * sim_genome_length, c = 2000
+  )  +
+  gaussian_function(
+    x, a = 1.0 * norm_a, b = 0.3 * sim_genome_length, c = 3000
+    ) +
+  gaussian_function(
+    x, a = 0.2 * norm_a, b = 0.6 * sim_genome_length, c = 3000
+    ) +
+  gaussian_function(
+    x, a = 1.6 * norm_a, b = 0.8 * sim_genome_length, c = 2000
+    ) +
+  gaussian_function(
+    x, a = 0.15 * norm_a, b = 0.5 * sim_genome_length, c = sim_genome_length
+    )
+
+y_single_peak = gaussian_function(
+  x, a = 1 * norm_a, b = 0.3 * sim_genome_length, c = 3000
+  ) +
+  gaussian_function(
+    x, a = 0.15 * norm_a, b = 0.5 * sim_genome_length, c = sim_genome_length
+    )
+
+max_y <- max(y, y_extreme, y_single_peak)
+max_y <- ceiling(max_y / (0.1 * 10^ceiling(log10(max_y)))) * 
+  (0.1 * 10^ceiling(log10(max_y)))
+
+ggarrange(
+  ggplot(data = as_tibble(list(x = x, y = y)), aes(x = x, y = y)) + 
+    geom_line() + nice_plot() + ylim(0, max_y) + labs(title = "nonuni"),
+  ggplot(data = as_tibble(list(x = x, y = y_extreme)), aes(x = x, y = y)) + 
+    geom_line() + nice_plot() + ylim(0, max_y) + labs(title = "nonuni_ext"),
+  ggplot(data = as_tibble(list(x = x, y = y_single_peak)), aes(x = x, y = y)) + 
+    geom_line() + nice_plot() + ylim(0, max_y) + labs(title = "nonuni_single"),
+  ncol = 1
+)
+```
+
+The depth profiles generated above are used to assign weights to each position
+along the genome. A position along the genome is randomly selected according to 
+the weights, and a depth of 1 is added to the next 150 positions. This process 
+is repeated for the number of reads required to achieve the desired depth. 
+
+```{r sim_functions}
+gen_depth_profile <- function(depth,
+                              prob_dist,
+                              read_length = 150,
+                              genome_length = 10 ^ 5) {
+  num_reads <- (genome_length / read_length) * depth
+  
+  genome_depth <- rep(0, genome_length + read_length)
+  reads <- sample(
+      c(1:genome_length),
+      size = num_reads,
+      replace = TRUE,
+      prob = prob_dist[1:genome_length]
+    )
+  
+  for (read in reads) {
+    genome_depth[read:(read + read_length)] <- 
+      genome_depth[read:(read + read_length)] + 1
+  }
+  
+  return(genome_depth)
+}
+
+calc_ref_ass_ratio <-
+  function(depth_profile,
+           min_depth = 1,
+           min_len = 1) {
+    # Determine stretches of depth
+    depth_runlength = rle(depth_profile >= min_depth)
+    depth_runlength$values[depth_runlength$values == 1 &
+                             depth_runlength$lengths < min_len] <- 0
+    
+    depth_profile_filtered <-
+      depth_profile * inverse.rle(depth_runlength)
+    return(
+      c(
+        depth_assembly = sum(depth_profile_filtered),
+        depth_ref = sum(depth_profile),
+        len_assembly =  sum(depth_profile_filtered > 0),
+        len_ref = length(depth_profile),
+        contig_coverage = sum(depth_profile > min_depth) / 
+          length(depth_profile),
+        relab_ratio = (
+          sum(depth_profile_filtered) / sum(depth_profile_filtered > 0)
+        ) / (sum(depth_profile) / length(depth_profile))
+      )
+    )
+  }
+
+```
+
+
+Then, the relative abundance based on the whole genome (the reference), and
+based on assembly is calculated. Assembly is simulated, by selecting a minimum
+read depth and a minimum length for generating a contig. First a mask is created
+according to the minimum read depth, marking all positions below the minimum 
+depth as 0 and all above as 1. Next, all sequences of 1 shorter than the minimum
+length are changed to 0. Finally, the depth profile is multiplied by this mask
+to remove areas and corresponding reads that would not be assembled.
+
+A simulated data set is created for a range of sequencing depths, minimum 
+lengths, and minimum read depths. Along with the non-uniform depth profiles, 
+a random uniform depth profile is simulated by randomly sampling from a uniform 
+distribution ("uni_random"). Lastly, a completely uniform depth profile is 
+generated as well with the desired depth throughout the sequence.  
+
+```{r sim_abundance_ratios}
+replicate <- paste(LETTERS[1:3])
+sim_depths <- c(30,20,10,7,5, 3.5, 2, 1.5, 1)
+min_depths <- c(1, 2, 3, 5)
+min_lens <- c(1, 150, 300, 500, 1000)
+
+sim_data_reps <- crossing(
+  replicate, depths = sim_depths, min_depth = min_depths, min_len = min_lens
+  ) %>%
+  rowwise() %>%
+  mutate(
+    ratios_nonuni = list(
+      calc_ref_ass_ratio(
+        gen_depth_profile(depths, y),
+        min_depth = min_depth,
+        min_len = min_len
+      )
+    ),
+    ratios_nonuni_ext = list(
+      calc_ref_ass_ratio(
+        gen_depth_profile(depths, y_extreme),
+        min_depth = min_depth,
+        min_len = min_len
+      )
+    ),
+    ratios_nonuni_single = list(
+      calc_ref_ass_ratio(
+        gen_depth_profile(depths, y_single_peak),
+        min_depth = min_depth,
+        min_len = min_len
+      )
+    ),
+    ratios_uni_random = list(
+      calc_ref_ass_ratio(
+        gen_depth_profile(depths,  rep(1, sim_genome_length + sim_read_length)),
+        min_depth = min_depth,
+        min_len = min_len
+      )
+    ),
+    ratios_uni_solid = list(
+      calc_ref_ass_ratio(
+        rep(depths, sim_genome_length + sim_read_length),
+        min_depth = min_depth,
+        min_len = min_len
+      )
+    )
+  ) %>%
+  pivot_longer(
+    cols = starts_with("ratios"),
+    names_to = "dist",
+    values_to = "ratios",
+    names_transform = function(dist)
+      str_remove(dist, "ratios_")
+  ) %>%
+  rowwise() %>%
+  mutate(
+    depth_assembly = ratios["depth_assembly"],
+    depth_ref = ratios["depth_ref"],
+    len_assembly = ratios["len_assembly"],
+    len_ref = ratios["len_ref"],
+    cov = ratios["contig_coverage"],
+    relab_ratio = ratios["relab_ratio"]
+  ) %>%
+  select(-ratios)
+```
+
+Assembly and reference coverage depths are simulated for several depths 
+(`r serial_comma(sim_depths)`), and `r length(replicate)` replicates are generated.
+
+Then assembly is simulated, using `r serial_comma(min_depths)` as minimum depths 
+and `r serial_comma(min_lens)` as minimum number of consecutive positions with
+at least a depth equal to the mininum depth. Below, the relationship between 
+overall sequencing depth and the coverage depth for the assembly and the 
+reference genome are plotted.
+
+```{r plot_sim_depths, fig.width=8, fig.height=8, out.width = "100%"}
+ggplot(
+  sim_data_reps,
+  aes(x = depths, y = depth_ref, color = dist)
+  ) +
+  geom_point() +
+  facet_grid(min_depth ~ min_len) +
+  nice_plot() +
+  scale_color_manual(values = pal_cat)
+
+ggplot(
+  sim_data_reps,
+  aes(x = depths, y = depth_assembly, color = dist)
+) +
+  geom_point() +
+  facet_grid(min_depth ~ min_len) +
+  nice_plot() +
+  scale_color_manual(values = pal_cat)
+```
+
+Unsurprisingly, there is a linear relationship between the reference genome 
+coverage depth and simulated sequencing depth. For low minimum depth and 
+minimum length, this also goes for the assembly coverage depth.
+
+```{r plot_sim_depths_maxdeplen}
+ggplot(
+  sim_data_reps %>%
+    filter(min_depth == max(min_depths) &
+             min_len == max(min_lens)) %>%
+    group_by(depths, min_depth, min_len, dist) %>%
+    summarise(depth_assembly = mean(depth_assembly)),
+  aes(x = depths, y = depth_assembly, color = dist)
+) +
+  geom_point() +
+  nice_plot() +
+  scale_color_manual(values = pal_cat)
+```
+
+However, as shown above for the largest minimum length (>=`r max(min_lens)` bp) 
+and depth (>=`r max(min_depths)` reads), for very low sequencing depths 
+(<`r max(min_depths)`X), the solid uniform simulation yields zero reads in the 
+assembly, because no position has a depth above that depth. For low sequencing
+depths, the non-uniform profiles produce an assembly coverage depth closer to the 
+actual sequencing depth than the uniform profiles. Likely because at low depths,
+the non-uniform profiles are more likely to yield at least some sequences that
+meet the minimum requirements. Above a given threshold depending on the selected 
+minimum depth and length, the random uniform profile produces a depth closer to 
+the sequencing 
+depth.
+
+```{r plot_sim_cov_relabratio}
+ggplot(
+  sim_data_reps,
+  aes(x = cov, y = relab_ratio, color = dist, shape = dist)
+) + 
+  geom_point() +
+  facet_grid(min_depth ~ min_len) +
+  nice_plot() + 
+  scale_color_manual(values = pal_cat) +
+  labs(
+    y = "[bp/kbp] (assembly) / [bp/kbp] (reference)",
+    x = "sequencing depth",
+    color = "depth profile", shape =  "depth profile"
+  )
+```
+
+
+```{r find_real_depths_and_lengths}
+min_len_depth_real <- left_join(
+  mc_contigs,
+  assembly_readmap_stats %>%
+    select(
+      assembly,
+      sample,
+      base_sample,
+      spike,
+      rt_method,
+      ref,
+      length,
+      mapped_reads
+    ) %>%
+    rename(contig = ref),
+  by = c('assembly', 'contig')
+) %>%
+  mutate(est_depth = (mapped_reads * 150) / length) %>%
+  ungroup() %>%
+  summarise(min_len = min(length), min_depth = min(est_depth))
+```
+
+In the real data set, the lowest coverage depth for MC contigs is
+`r round(min_len_depth_real$min_depth, digits = 2)`X, while the smallest length 
+is `r min_len_depth_real$min_len` bases. 
+
+```{r plot_sim_depth_vs_cov}
+sim_data <- sim_data_reps %>%
+  group_by(depths, min_depth, min_len, dist) %>%
+  summarise(
+    cov = mean(cov),
+    relab_ratio = mean(relab_ratio),
+    .groups = "keep"
+  )
+
+depth_vs_cov_vs_ratio <- ggarrange(
+  ggplot(
+    sim_data %>% 
+      filter(min_depth == 2 & min_len == 300),
+    aes(x = depths, y = cov, shape = dist, color = dist)
+  ) + 
+    geom_point() +
+    nice_plot() +
+    scale_color_manual(values = pal_cat) +
+    labs(
+      y = "coverage",
+      x = "sequencing depth",
+      color = "depth profile", 
+      shape =  "depth profile"
+    ),
+  
+  ggplot(
+    sim_data %>% 
+      filter(min_depth == 2 & min_len == 300),
+    aes(x = depths, y = relab_ratio, shape = dist, color = dist)
+  ) + 
+    geom_point() +
+    nice_plot() +
+    scale_x_log10() +
+    scale_color_manual(values = pal_cat) +
+    labs(
+      y = "[bp/kbp] (assembly) / [bp/kbp] (reference)",
+      x = "sequencing depth",
+      color = "depth profile", 
+      shape =  "depth profile"
+    ),
+  ncol = 2,
+  common.legend = TRUE,
+  legend = "bottom"
+)
+
+depth_vs_cov_vs_ratio
+
+ggsave(
+  "figures/mc_assembly/sim_dep_vs_cov_vs_ratio.png",
+  plot = depth_vs_cov_vs_ratio,
+  width=16, height=10, unit="cm", dpi=300
+  )  
+```
+
+Choosing a realistic threshold of a minimum depth of 2X and a minimum 
+length of 300 shows that a uniform sequencing depth
+produces higher coverage in the assembly (left panel), and a lower difference
+between the assembly-based and the reference-based abundance calculation (right
+panel).
+
+```{r plot_sim_cov_relabratio_medium}
+ggplot(
+  sim_data %>% filter(min_len == 300 & min_depth == 2),
+  aes(x = cov, y = relab_ratio, color = dist)
+) + 
+  geom_line() +
+  geom_point() +
+  nice_plot() + 
+  scale_color_manual(values = pal_cat) +
+  labs(
+    x = "assembly coverage",
+    y = "[bp/kbp] (assembly) / [bp/kbp] (reference)",
+    color = "depth profile", 
+    shape =  "depth profile"
+  )
+```
+
+Likewise, the least uniform distributions have the lowest deviation from the 
+actual reference-based abundance at lower assembly coverage. The ratio between
+assembly- and reference-based abundance differs between the non-uniform 
+profiles.
+
+```{r real_vs_sim}
+mc_depth_cov_ratio <- left_join(
+  rpkm_ref_vs_ass,
+  mc_read_depth %>%
+    left_join(mc_ref_to_virus, by = "ref") %>%
+    group_by(base_sample, spike, rt_method, virus) %>% 
+    summarise(length = n(), tot_bp = sum(depth)) %>% 
+    mutate(read_depth = tot_bp / length),
+  by = join_by(base_sample, spike, rt_method, virus)
+)
+
+ggplot(
+  rbind(
+    mc_depth_cov_ratio %>%
+      ungroup() %>%
+      select(
+        base_sample,
+        spike,
+        rt_method,
+        virus,
+        perc_cov,
+        rpkm_assembly,
+        rpkm_ref
+      ) %>%
+      mutate(fd_abundance = rpkm_assembly / rpkm_ref) %>% 
+      select(-rpkm_assembly, -rpkm_ref),
+    sim_data_reps %>%
+      ungroup() %>% 
+      filter(dist %in% c("nonuni") & min_depth == 2 & min_len == 300) %>%
+      mutate(
+        base_sample = "sim",
+        spike = "sim",
+        virus = "sim",
+        rpkm_assembly = depth_assembly / len_assembly,
+        rpkm_ref = depth_ref / len_ref,
+        fd_abundance = rpkm_assembly / rpkm_ref
+      ) %>%
+      rename(
+        rt_method = dist,
+        perc_cov = cov
+      ) %>% 
+      select(base_sample, spike, rt_method, virus, perc_cov, fd_abundance)
+  ),
+  aes(x = perc_cov, y = fd_abundance, color = rt_method)
+) +
+  geom_point() +
+  geom_line(data = as_tibble(list(
+    x = seq(0.005, 1, length.out = 100),
+    y = 1 / seq(0.005, 1, length.out = 100)
+  )), aes(x = x, y = y, color = "1/x")) +
+  nice_plot() +
+  scale_y_continuous(trans = "log2") +
+  scale_color_manual(values = c(method_palette,
+                                "nonuni" = pal_cat[3],
+                                "1/x" = pal_cat[6]))
+``` 
+
+Overlaying the simulated assembly / reference abundance ratios on the actual 
+data, shows agreement between the simulation and the real data. The ratio
+roughly follows an $1/x$ relationship with the % coverage.
+
+```{r sim_real_depth_profiles}
+selected_viruses <- c("Det7", "T5", "P22", "M13")
+
+mc_virus_mean_depth_profiles <- mc_read_depth %>%
+  left_join(
+    mc_read_coverage,
+    by = join_by(sample, base_sample, spike, rt_method, ref)
+  ) %>% 
+  filter(coverage >= .8 & ref  %in% selected_viruses) %>% 
+  group_by(rt_method, ref,  bp) %>% 
+  summarise(depth_norm=mean(na.omit(depth_norm)))
+
+get_virus_profile <- function(df, virus, method){
+  return(
+    df %>% filter(ref == virus & rt_method == method) %>% pull(depth_norm)
+  )
+}
+
+mc_virus_depth_profiles <- crossing(virus = selected_viruses, rt_method = c("WTA2", "SISPA")) %>% 
+  rowwise() %>% 
+  mutate(depth_profile = list(get_virus_profile(mc_virus_mean_depth_profiles, virus, rt_method)))
+
+sim_mc_reps <- crossing(
+  replicate = LETTERS[1:3],
+  depth = c(sim_depths, 0.5, 0.2),
+  mc_virus_depth_profiles
+) %>%
+  mutate(min_depth = 2, min_len = 300) %>%
+  rowwise() %>%
+  mutate(profile_stats = list(
+    calc_ref_ass_ratio(
+      gen_depth_profile(depth, depth_profile, genome_length = length(depth_profile)),
+      min_depth = min_depth,
+      min_len = min_len
+    )
+  )) %>%
+  rowwise() %>%
+  mutate(
+    depth_assembly = profile_stats["depth_assembly"],
+    depth_ref = profile_stats["depth_ref"],
+    len_assembly = profile_stats["len_assembly"],
+    len_ref = profile_stats["len_ref"],
+    cov = profile_stats["contig_coverage"],
+    relab_ratio = profile_stats["relab_ratio"]
+  ) %>%
+  select(-profile_stats)
+```
+
+Next, the MC virus coverage depth profiles are used as probability distributions
+to simulate sequencing the viruses and comparing different methods and viruses. 
+Viruses with >=80% coverage are chosen.
+
+```{r plot_real_virus_sim_covdep}
+sim_mc_depth_vs_cov_vs_ratio <- ggarrange(
+  ggplot(
+    sim_mc_reps %>% 
+      group_by(virus, rt_method, depth) %>% 
+      summarise(cov = mean(cov),.groups = "keep"),
+    aes(
+      x = depth,
+      y = cov,
+      color = virus,
+      shape = rt_method,
+      linetype = rt_method
+    )
+  ) + 
+    geom_point() +
+    geom_line() +
+    nice_plot() +
+    scale_linetype_manual(values = c("WTA2" = "solid", "SISPA" = "dashed"))+
+    scale_shape_manual(values = c("WTA2" = 16, "SISPA" = 1)) +
+    colorscheme_virus_color+
+    labs(
+      y = "coverage",
+      x = "sequencing depth",
+      color = "virus", shape =  "method", linetype = "method"
+    ),
+  ggplot(
+    sim_mc_reps %>%
+      group_by(virus, rt_method, depth) %>%
+      summarise(relab_ratio = mean(relab_ratio)),
+    aes(
+      x = depth,
+      y = relab_ratio,
+      color = virus,
+      shape = rt_method,
+      linetype = rt_method
+    )
+  )+ 
+    geom_point() +
+    geom_line() +
+    nice_plot() +
+    scale_x_log10() +
+    scale_linetype_manual(values = c("WTA2" = "solid", "SISPA" = "dashed"))+
+    scale_shape_manual(values = c("WTA2" = 16, "SISPA" = 1)) +
+    colorscheme_virus_color+
+    labs(
+      y = "[bp/kbp] (assembly) / [bp/kbp] (reference)",
+      x = "coverage depth (X)",
+      color = "virus", shape =  "method", linetype = "method"
+    ),
+  ncol = 2,
+  common.legend = TRUE,
+  legend = "bottom"
+)
+
+sim_mc_depth_vs_cov_vs_ratio
+
+ggsave(
+  "figures/mc_assembly/sim_real-mc_dep_vs_cov_vs_ratio.png", 
+  plot = sim_mc_depth_vs_cov_vs_ratio,
+  width=16, height=10, unit="cm", dpi=300
+  )
+```
+
+```{r stats_tot_cov}
+mc_assembly_cov_stats <- mc_rpkms %>% 
+  left_join(
+    mc_readmap_stats %>%
+      ungroup() %>% 
+      distinct(virus, ref_length) %>% rename(ref_length_full = ref_length),
+    by = "virus"
+  ) %>% 
+  group_by(base_sample, spike, rt_method, virus) %>% 
+  summarise(
+    n_contigs = n(),
+    assembly_cov = sum(length),
+    ref_length = first(ref_length_full)
+  ) %>% 
+  mutate(
+    p_assembly_cov = 100 * assembly_cov / ref_length
+  ) %>% 
+  filter(spike == "HI")
+  
+
+mc_assembly_cov_stats %>% 
+  filter(virus %in% c("T5", "Det7", "P22", "M13")) %>% 
+  pivot_wider(names_from = rt_method, values_from = c(n_contigs, assembly_cov, p_assembly_cov)) %>% 
+  arrange(virus)
+
+mc_assembly_cov_stats %>% 
+  filter(virus %in% c("MHV", "RV-A", "BVDV"))
+
+mc_rpkms %>% 
+  filter(base_sample %in% base_sample_faecal) %>% 
+  group_by(assembly, virus) %>% 
+  summarise(rpkm_min = min(rpkm), rpkm_max = max(rpkm)) %>% 
+  mutate(fd_rpkm = rpkm_max / rpkm_min) %>% 
+  arrange(desc(fd_rpkm))
+```
+
+```{r stats_min_cov_max_overest}
+ref_vs_ass_abundance %>%
+  filter(fd_abundance_median <=2 & !(rt_method == "WTA2" & virus == "T5" & base_sample != "S07")) %>%
+  ungroup() %>%
+  summarise(
+    min_cov_max_100 = min(ref_cov_contig[fd_abundance_median <= 2.0]),
+    min_cov_max_050 = min(ref_cov_contig[fd_abundance_median <= 1.5]),
+    min_cov_max_020 = min(ref_cov_contig[fd_abundance_median <= 1.2]),
+    min_cov_max_010 = min(ref_cov_contig[fd_abundance_median <= 1.1]),
+  )
+
+left_join(
+  mc_readmap_stats %>% 
+    group_by(sample, virus) %>% 
+    summarise(
+      tot_reads = sum(mapped_reads)
+    ),
+  mc_rpkms %>% 
+    group_by(sample, virus) %>% 
+    summarise(
+      tot_reads_assembly = sum(mapped_reads)
+    ),
+  by = c("sample","virus")
+) %>% 
+  mutate(
+    diff = tot_reads - tot_reads_assembly
+  ) %>% 
+  arrange(desc(diff))
+```
+
+```{r plot_real_virus_sim_fd_abundance}
+real_vs_sim_fdabundance <- rbind(
+  sim_mc_reps %>% 
+    group_by(virus, rt_method, depth) %>% 
+    mutate(sim_real = "sim"),
+  rpkm_ref_vs_ass %>% 
+    ungroup() %>% 
+    filter(virus %in% selected_viruses) %>% 
+    mutate(
+      relab_ratio = rpkm_assembly / rpkm_ref,
+      depth = rpkm_ref * (ref_length / 10^3) * (tot_reads / 10^6)     
+      ) %>% 
+    rename(cov = perc_cov) %>% 
+    select(virus, rt_method, depth, cov, relab_ratio) %>% 
+    mutate(sim_real = "real")
+)
+
+ggplot(
+  real_vs_sim_fdabundance,
+  aes(
+    x = cov,
+    y = relab_ratio,
+    color = virus,
+    shape = sim_real,
+    alpha = sim_real
+  )
+) +
+  geom_point() +
+  # facet_wrap(~sim_real) +
+  nice_plot() +
+  colorscheme_virus_color +
+  scale_shape_manual(values = c("sim" = 1, "real" = 19))+ 
+  scale_alpha_manual(values = c("sim" = 0.5, "real" = 1))
+
+ggplot(
+  real_vs_sim_fdabundance,
+  aes(
+    x = cov,
+    y = relab_ratio,
+    color = rt_method,
+    shape = sim_real,
+    alpha = sim_real
+  )
+) +
+  geom_point() +
+  # facet_wrap(~sim_real) +
+  nice_plot() +
+  scale_color_manual(values = method_palette) +
+  scale_shape_manual(values = c("sim" = 1, "real" = 19)) + 
+  scale_alpha_manual(values = c("sim" = 0.5, "real" = 1))
+```
+
+And overlaying the real data onto the simulated data, this time simulated 
+based on the actual depth profiles, again shows agreement between the simulated
+data and the real data. 
+
