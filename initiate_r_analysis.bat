@@ -31,8 +31,8 @@ goto :init
     goto :parse
 
 :main
-    Rscript R\process_data.R %1
-    Rscript generate_reports.R %1
+    Rscript R\process_data.R %output_dir%
+    Rscript generate_reports.R %output_dir%
 
 :end
     call :cleanup
