@@ -1,4 +1,4 @@
-# MC Spike metagenomic virome analysis
+# MC-spike: Assessment of bias and reproducibility of viral metagenomics methods
 
 The pipeline consists of a Nextflow script which runs the bioinformatics tools that perform the bulk of the analysis. A collection of R and R Markdown scripts is provided to perform the final part of the analysis, combining output files from the Nextflow pipeline to generating figures and statistics.
 
@@ -48,7 +48,7 @@ The pipeline uses CheckV and geNomad, which each depend on their databases. The 
 
 ## Configuring the pipeline
 
-There are two files for that can be edited to configure the pipeline. The first is `./config/main.config`, in which the nextflow script is configured. This includes changing paths to various files and folders, and setting the computing resources for the various steps of the pipeline. These parameters are configured separately for the `vm` and `hpc` profiles. The other file is `./config/sample_sheet.csv`, which defines the sample metadata and raw read file names.
+There are two main files that can be edited to configure the pipeline, including for analysis of your own data. The first is `./config/main.config`, in which the nextflow script is configured. This includes changing paths to various files and folders, and setting the computing resources for the various steps of the pipeline. These parameters are configured separately for the `vm` and `hpc` profiles. The other file is `./config/sample_sheet.csv`, which defines the sample metadata and raw read file names.
 
 ### main.config
 
@@ -96,7 +96,7 @@ If the assembly groups are changed, or multiple replicates of identical treatmen
 
 ### Mock Community particle counts and reference names
 
-The file `mock_community_particles_added.csv` contains three columns with info on the number of particles added to the Mock Community for each virus, and the number of strands (single our double). The file `mock_community_ref_to_virus.csv` contains a table translating the sequence ID in the mock community fasta file to an individual virus. The `--vlp_counts` and `--mc_refnames` options can be used to change the files.
+When analysing your own data, there are two additional files that the R reports depend on. The file `mock_community_particles_added.csv` contains three columns with info on the number of particles added to the Mock Community for each virus, and the number of strands (single our double). The file `mock_community_ref_to_virus.csv` contains a table translating the sequence ID in the mock community fasta file to an individual virus. The `--vlp_counts` and `--mc_refnames` options can be used to change the files.
 
 ## Running the pipeline
 
