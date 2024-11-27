@@ -114,3 +114,9 @@ To run the pipeline:
 4. On your server, move into a temporary folder with sufficient disk space.
 5. Run the nextflow pipeline using `nextflow run ${mc_spike}/main.nf -config ${mcspike}/config/main.config -profile hpc,singularity_local` (or another `-profile`, as described above). Here, `$mcspike` points to the MC Spike project folder and the profile can be selected using the `-profile` option. A different configuration file can be used with the Netflow `-config` option.
 6. Once Nextflow has finished, run `./initiate_r_analysis.sh`, or run `Rscript ./R/process_data.R`, followed by `Rscript ./R/generate_reports.R` to generate figures and reports.
+
+## Citation
+
+A manuscript is in preparation, meanwhile, a preprint is available at:
+
+> Haagmans, R.; Charity, O. J.; Baker, D.; Telatin, A.; Savva, G. M.; Adriaenssens, E. M.; Powell, P.; Carding, S. R. Assessing Bias and | Reproducibility of Viral Metagenomics Methods for the Combined Detection of Faecal RNA and DNA Viruses. Preprints 2024, 2024112016. https://doi.org/10.20944/preprints202411.2016.v1
